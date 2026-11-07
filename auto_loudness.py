@@ -273,18 +273,23 @@ def find_target(card_name, nodes):
     return None
 
 
-def pw_params(gains, mult):
-    return " ".join(f'"eq{i}:Gain" {g:.3f}' for i, g in enumerate(gains)) + f' "out:Mult" {mult:.6f}'
-
-
 def filter_chain_conf(target, eq, gains, mult):
-    """Graph: user EQ (fixed) -> loudness bands -> output gain, all starting at their real values."""
+    """Graph: input -> user EQ (fixed) -> two identical loudness chains a/b -> mixer.
+
+    PipeWire's biquads reset their state on every parameter change (audible click), so new
+    values go to the silent chain, which is then crossfaded in (see Fader)."""
     nodes = [(f"u{i}", b["type"], b["freq"], b["q"], b["gain"]) for i, b in enumerate(eq)]
-    nodes += [(f"eq{i}", "peaking", f, Q, g) for i, (f, g) in enumerate(zip(BANDS, gains))]
+    for c in "ab":
+        nodes += [(f"{c}{i}", "peaking", f, Q, g) for i, (f, g) in enumerate(zip(BANDS, gains))]
     eqs = "\n".join(f'          {{ type = builtin name = {n} label = bq_{t} '
                     f'control = {{ "Freq" = {f} "Q" = {q} "Gain" = {g:.3f} }} }}' for n, t, f, q, g in nodes)
-    names = [n[0] for n in nodes] + ["out"]
-    links = "\n".join(f'          {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(names, names[1:]))
+    pre = ["in"] + [f"u{i}" for i in range(len(eq))]
+    last = len(BANDS) - 1
+    pairs = list(zip(pre, pre[1:])) + [(pre[-1], "a0"), (pre[-1], "b0")]
+    pairs += [(f"{c}{i}", f"{c}{i + 1}") for c in "ab" for i in range(last)]
+    links = "\n".join(f'          {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in pairs)
+    links += (f'\n          {{ output = "a{last}:Out" input = "mix:In 1" }}'
+              f'\n          {{ output = "b{last}:Out" input = "mix:In 2" }}')
     return f"""
 context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }}
 context.modules = [
@@ -297,14 +302,15 @@ context.modules = [
       node.description = "Loudness"
       filter.graph = {{
         nodes = [
+          {{ type = builtin name = in label = copy }}
 {eqs}
-          {{ type = builtin name = out label = linear control = {{ "Mult" = {mult:.6f} "Add" = 0.0 }} }}
+          {{ type = builtin name = mix label = mixer control = {{ "Gain 1" = {mult:.6f} "Gain 2" = 0.0 }} }}
         ]
         links = [
 {links}
         ]
-        inputs = [ "{names[0]}:In" ]
-        outputs = [ "out:Out" ]
+        inputs = [ "in:In" ]
+        outputs = [ "mix:Out" ]
       }}
       audio.channels = 2
       audio.position = [ FL FR ]
@@ -326,11 +332,33 @@ def log(knob, gains, mult, eq):
                                                  (("40 Hz", 40), ("1 kHz", 1000), ("10 kHz", 10000))), flush=True)
 
 
-def set_params(node_id, knob, cfg):
-    gains, mult = eq_params(knob, cfg)
-    sp.run(["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {pw_params(gains, mult)} ] }}"],
-           check=True, stdout=sp.DEVNULL)
-    log(knob, gains, mult, cfg["eq"])
+class Fader:
+    """Click-free updates: retune the silent chain, let it settle, then crossfade to it."""
+    SETTLE = 0.08  # s; lowest band (31.5 Hz, Q 0.7) decays in ~7 ms, plus a quantum or two
+    FADE, STEPS = 0.3, 60  # measured: clicks ~-75 dBFS (hard switch: -47 dBFS)
+
+    def __init__(self, node_id, mult):
+        self.node, self.active, self.mult = node_id, "a", mult
+        self.cli = sp.Popen(["pw-cli"], stdin=sp.PIPE, stdout=sp.DEVNULL, stderr=sp.DEVNULL, text=True)
+
+    def send(self, params):
+        self.cli.stdin.write(f"set-param {self.node} Props {{ params = [ {params} ] }}\n")
+        self.cli.stdin.flush()
+
+    def apply(self, gains, mult):
+        idle = "b" if self.active == "a" else "a"
+        self.send(" ".join(f'"{idle}{i}:Gain" {g:.3f}' for i, g in enumerate(gains)))
+        time.sleep(self.SETTLE)
+        old_in, new_in = ("1", "2") if self.active == "a" else ("2", "1")
+        for step in range(1, self.STEPS + 1):
+            f = step / self.STEPS
+            self.send(f'"mix:Gain {old_in}" {(1 - f) * self.mult:.6f} "mix:Gain {new_in}" {f * mult:.6f}')
+            time.sleep(self.FADE / self.STEPS)
+        self.active, self.mult = idle, mult
+
+    def close(self):
+        self.cli.terminate()
+        self.cli.wait(timeout=5)
 
 
 def run(cfg, card, target, knob):
@@ -338,7 +366,7 @@ def run(cfg, card, target, knob):
     gains, mult = eq_params(knob, cfg)
     conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
     conf.write_text(filter_chain_conf(target, cfg["eq"], gains, mult))
-    chain = monitor = None
+    chain = monitor = fader = None
     try:
         chain = sp.Popen(["pipewire", "-c", str(conf)])
         monitor = sp.Popen(["alsactl", "monitor", f"hw:{card}"], stdout=sp.PIPE, stderr=sp.DEVNULL)
@@ -351,6 +379,7 @@ def run(cfg, card, target, knob):
             sys.exit("filter-chain sink did not appear")
         print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands", flush=True)
         log(knob, gains, mult, cfg["eq"])
+        fader = Fader(node["id"], mult)
 
         while chain.poll() is None:
             # events give instant updates; the 1 s timeout is a polling fallback
@@ -370,9 +399,13 @@ def run(cfg, card, target, knob):
                 return "4i4 disconnected"
             if new != knob:
                 knob = new
-                set_params(node["id"], knob, cfg)
+                gains, mult = eq_params(knob, cfg)
+                fader.apply(gains, mult)
+                log(knob, gains, mult, cfg["eq"])
         sys.exit(f"filter-chain exited with {chain.returncode}")
     finally:
+        if fader:
+            fader.close()
         for p in (monitor, chain):
             if p:
                 p.terminate()
