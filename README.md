@@ -23,8 +23,17 @@ apps ─▶ EasyEffects (room EQ) ─▶ "Loudness" sink ─▶ Scarlett 4i4 ─
   gives; at the reference position nothing changes at all.
 - Below `low_hz` (default 40 Hz) no extra bass is added: small monitors can't
   play it, and it would only cost woofer excursion.
-- The filter-chain never falls back to another output: if the 4i4 is missing,
-  the Loudness sink stays silent instead of playing on the default device.
+- The Loudness sink only ever plays into the 4i4: no fallback to the default
+  sink, and it can't be moved in a mixer app. If the 4i4 is unplugged while
+  the service runs, the sink stays and is silent.
+- **Limit:** when the service stops, crashes, or restarts (unplug, profile
+  change), the Loudness sink disappears and WirePlumber moves apps that were
+  playing into it to the default sink, at their normal level, without
+  compensation. Make the 4i4 the default sink so that this fallback goes where
+  the speakers are.
+- The compensation assumes the reference listening level stays fixed: after
+  `calibrate`, leave the software volumes (apps, EasyEffects, sinks) alone and
+  use only the knob.
 
 ## Install
 

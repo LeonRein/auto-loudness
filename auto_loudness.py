@@ -54,14 +54,29 @@ def contour(phon):
             for a, u, t in zip(ISO_AF, ISO_LU, ISO_TF)]
 
 
-def target_gains(knob_rel, low_hz=40.0):
-    """Knob offset from reference (dB, <= 0) -> cut-only gain (dB) at each ISO_F, max 0."""
-    phon = max(MIN_PHON, REF_PHON + knob_rel)
+def shape(phon, low_hz):
+    """Cut-only gain (dB) at each ISO_F that turns the reference balance into the one at `phon`."""
     raw = [(c - phon) - (r - REF_PHON) for c, r in zip(contour(phon), contour(REF_PHON))]
     floor = interp(low_hz, ISO_F, raw)
     raw = [floor if f < low_hz else g for f, g in zip(ISO_F, raw)]
     top = max(raw)
     return [g - top for g in raw]
+
+
+def target_gains(knob_rel, low_hz=40.0):
+    """Knob offset from reference (dB, <= 0) -> cut-only gain (dB) at each ISO_F, max 0."""
+    # The cut at 1 kHz lowers the real listening level below REF_PHON + knob_rel, which needs
+    # a stronger contour: bisect for the level where both agree (monotonic, clamped to 20 phon).
+    if knob_rel >= 0:
+        return [0.0] * len(ISO_F)
+    lo, hi = MIN_PHON, REF_PHON
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        if mid > REF_PHON + knob_rel + shape(mid, low_hz)[ISO_F.index(1000)]:
+            hi = mid
+        else:
+            lo = mid
+    return shape(lo, low_hz)
 
 
 def interp(f, xs, ys):
@@ -120,6 +135,8 @@ def eq_params(knob_db, cfg):
         atr = [sum(row[i] * x for row, x in zip(m, r)) for i in range(n)]
         gains = [g + d for g, d in zip(gains, solve(ata, atr))]
     peak = max(response(f, gains) for f in GRID)
+    if any(abs(g) > 1e-6 for g in gains):
+        peak += 0.01  # margin for peaks between grid points
     return gains, 10 ** (-max(0.0, peak) / 20)  # guarantees the whole response stays <= 0 dB
 
 
@@ -131,6 +148,12 @@ def load_config():
         unknown = user.keys() - DEFAULTS.keys()
         if unknown:
             sys.exit(f"{CONFIG}: unknown keys {sorted(unknown)}")
+        for k, v in user.items():
+            want_str = isinstance(DEFAULTS[k], str)
+            if (isinstance(v, str) != want_str) or isinstance(v, bool) or not isinstance(v, (str, int, float)):
+                sys.exit(f"{CONFIG}: {k} must be {'a string' if want_str else 'a number'}")
+        if any(c in user.get("target", "") for c in '"\\'):
+            sys.exit(f"{CONFIG}: target must not contain quotes or backslashes")
         cfg.update(user)
     return cfg
 
@@ -148,6 +171,8 @@ def parse_amixer(out):
     rng = re.search(r"min=(-?\d+),max=(-?\d+)", out)
     db = re.search(r"dBminmax-min=(-?[\d.]+)dB,max=(-?[\d.]+)dB", out)
     val = re.search(r": values=(-?\d+)", out)
+    if not (rng and db and val):
+        sys.exit(f"unexpected amixer output (no dB range?):\n{out}")
     vmin, vmax = int(rng[1]), int(rng[2])
     return float(db[1]) + (int(val[1]) - vmin) / (vmax - vmin) * (float(db[2]) - float(db[1]))
 
@@ -182,13 +207,13 @@ def pw_nodes():
             if o.get("type") == "PipeWire:Interface:Node"}
 
 
-def find_target(card_name):
-    # shortcut: resolved once at start; a profile change renames the sink, restart the service then.
+def find_target(card_name, nodes):
+    """First PipeWire sink of the card, or None. Its name changes with the card profile."""
     prefix = "alsa_output.usb-Focusrite_" + card_name.replace(" ", "_")
-    for name, o in pw_nodes().items():
+    for name, o in nodes.items():
         if name and name.startswith(prefix) and o["info"]["props"].get("media.class") == "Audio/Sink":
             return name
-    sys.exit(f"no PipeWire sink starting with {prefix}")
+    return None
 
 
 def pw_params(gains, mult):
@@ -225,10 +250,11 @@ context.modules = [
       audio.channels = 2
       audio.position = [ FL FR ]
       capture.props  = {{ node.name = "{SINK_NAME}" media.class = Audio/Sink }}
+      # Only ever play into the target: no fallback to the default sink, no moving it in a
+      # mixer app, and if the target is missing, wait silently instead of being destroyed.
       playback.props = {{ node.name = "{SINK_NAME}.out" node.passive = true
-                          target.object = "{target}" node.dont-reconnect = true
-                          # never fall back to the default sink (the speakers' interface)
-                          node.dont-fallback = true }}
+                          target.object = "{target}" node.dont-fallback = true
+                          node.linger = true node.dont-move = true }}
     }}
   }}
 ]
@@ -252,13 +278,18 @@ def main():
     cfg = load_config()
     card = find_card(cfg["card"])
     knob = read_knob(card, cfg["control"])  # fail early with a clear message
-    target = cfg["target"] or find_target(cfg["card"])
-    conf = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "auto-loudness.conf"
+    target = cfg["target"] or find_target(cfg["card"], pw_nodes())
+    if not target:
+        sys.exit(f"no PipeWire output of {cfg['card']!r} found")
+    if "XDG_RUNTIME_DIR" not in os.environ:
+        sys.exit("XDG_RUNTIME_DIR not set: run as a systemd user service or in a login session")
+    conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
     conf.write_text(filter_chain_conf(target))
-    chain = sp.Popen(["pipewire", "-c", str(conf)])
-    monitor = sp.Popen(["alsactl", "monitor", f"hw:{card}"], stdout=sp.PIPE)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    chain = monitor = None
     try:
+        chain = sp.Popen(["pipewire", "-c", str(conf)])
+        monitor = sp.Popen(["alsactl", "monitor", f"hw:{card}"], stdout=sp.PIPE)
         for _ in range(50):
             node = pw_nodes().get(SINK_NAME)
             if node:
@@ -274,14 +305,22 @@ def main():
             if select.select([monitor.stdout], [], [], 1.0)[0]:
                 if not os.read(monitor.stdout.fileno(), 4096):
                     sys.exit("alsactl monitor exited (device unplugged?)")
+            nodes = pw_nodes()
+            # the pipewire child keeps running even when its filter-chain module is gone
+            if SINK_NAME not in nodes:
+                sys.exit("Loudness sink vanished")
+            current = cfg["target"] or find_target(cfg["card"], nodes) or target
+            if current != target:
+                sys.exit(f"output renamed to {current} (profile change?), restarting")
             new = read_knob(card, cfg["control"])
             if new != knob:
                 knob = new
                 set_params(node["id"], knob, cfg)
         sys.exit(f"filter-chain exited with {chain.returncode}")
     finally:
-        monitor.terminate()
-        chain.terminate()
+        for p in (monitor, chain):
+            if p:
+                p.terminate()
 
 
 if __name__ == "__main__":
