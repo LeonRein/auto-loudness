@@ -24,8 +24,8 @@ apps ─▶ EasyEffects (room EQ) ─▶ "Loudness" sink ─▶ Scarlett 4i4 ─
 - Below `low_hz` (default 40 Hz) no extra bass is added: small monitors can't
   play it, and it would only cost woofer excursion.
 - The Loudness sink only ever plays into the 4i4: no fallback to the default
-  sink, and it can't be moved in a mixer app. If the 4i4 is unplugged while
-  the service runs, the sink stays and is silent.
+  sink, and it can't be moved in a mixer app. If its target output is
+  missing, the sink stays silent instead of playing elsewhere.
 - **Limit:** when the service stops, crashes, or restarts (unplug, profile
   change), the Loudness sink disappears and WirePlumber moves apps that were
   playing into it to the default sink, at their normal level, without
