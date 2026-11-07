@@ -25,6 +25,7 @@ DEFAULTS = {
     "target": "",          # PipeWire sink node.name to play into; "" = first sink of `card`
     "ref_knob_db": 0.0,    # knob position (dB) at which music sounds "right" -> flat response
     "low_hz": 40.0,        # no extra bass below this (speaker limit; saves woofer excursion)
+    "strength": 1.0,       # 1 = full ISO 226 compensation, smaller = gentler, 0 = off
 }
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auto-loudness/config.toml"
 SINK_NAME = "auto_loudness"
@@ -54,16 +55,16 @@ def contour(phon):
             for a, u, t in zip(ISO_AF, ISO_LU, ISO_TF)]
 
 
-def shape(phon, low_hz):
+def shape(phon, low_hz, strength=1.0):
     """Cut-only gain (dB) at each ISO_F that turns the reference balance into the one at `phon`."""
     raw = [(c - phon) - (r - REF_PHON) for c, r in zip(contour(phon), contour(REF_PHON))]
     floor = interp(low_hz, ISO_F, raw)
     raw = [floor if f < low_hz else g for f, g in zip(ISO_F, raw)]
     top = max(raw)
-    return [g - top for g in raw]
+    return [(g - top) * strength for g in raw]
 
 
-def target_gains(knob_rel, low_hz=40.0):
+def target_gains(knob_rel, low_hz=40.0, strength=1.0):
     """Knob offset from reference (dB, <= 0) -> cut-only gain (dB) at each ISO_F, max 0."""
     # The cut at 1 kHz lowers the real listening level below REF_PHON + knob_rel, which needs
     # a stronger contour: bisect for the level where both agree (monotonic, clamped to 20 phon).
@@ -72,11 +73,11 @@ def target_gains(knob_rel, low_hz=40.0):
     lo, hi = MIN_PHON, REF_PHON
     for _ in range(30):
         mid = (lo + hi) / 2
-        if mid > REF_PHON + knob_rel + shape(mid, low_hz)[ISO_F.index(1000)]:
+        if mid > REF_PHON + knob_rel + shape(mid, low_hz, strength)[ISO_F.index(1000)]:
             hi = mid
         else:
             lo = mid
-    return shape(lo, low_hz)
+    return shape(lo, low_hz, strength)
 
 
 def interp(f, xs, ys):
@@ -124,7 +125,8 @@ def solve(a, b):
 
 def eq_params(knob_db, cfg):
     """Knob position -> (band gains in dB, linear output gain <= 1)."""
-    target = target_gains(min(0.0, knob_db - cfg["ref_knob_db"]), cfg["low_hz"])
+    target = target_gains(min(0.0, knob_db - cfg["ref_knob_db"]), cfg["low_hz"],
+                          min(1.0, max(0.0, cfg["strength"])))
     pts, want = ISO_F + [16000], target + [target[-1]]  # hold the 12.5 kHz value above
     # least squares on the overlapping bands; a few Gauss-Newton steps fix the slight non-linearity
     m = [[peaking_db(f, f0, 1.0) for f0 in BANDS] for f in pts]

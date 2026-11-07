@@ -42,6 +42,11 @@ class Test(unittest.TestCase):
                   for f in ISO_F if 31.5 <= f <= 12500)
         self.assertLess(err, 1.5)
 
+    def test_strength(self):
+        full, half = target_gains(-20, 40, 1.0), target_gains(-20, 40, 0.5)
+        self.assertTrue(all(h >= f for h, f in zip(half, full)))  # weaker cut
+        self.assertTrue(all(abs(g) < 1e-9 for g in target_gains(-20, 40, 0.0)))
+
 
 if __name__ == "__main__":
     unittest.main()

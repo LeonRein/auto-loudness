@@ -5,6 +5,9 @@
 # loudness compensation below. Easiest: turn the knob there and run `auto-loudness calibrate`.
 ref_knob_db = 0.0
 
+# How strong the compensation is: 1.0 = full ISO 226, smaller = gentler, 0 = off.
+#strength = 1.0
+
 # No extra bass below this frequency (set to your speakers' lower limit).
 #low_hz = 40.0
 
