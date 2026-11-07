@@ -26,14 +26,12 @@ apps ─▶ "Loudness" sink (room EQ + loudness) ─▶ Scarlett 4i4 ─▶ knob
   gives; at the reference position nothing changes at all.
 - Below `low_hz` (default 40 Hz) no extra bass is added: small monitors can't
   play it, and it would only cost woofer excursion.
-- The Loudness sink only ever plays into the 4i4: no fallback to the default
-  sink, and it can't be moved in a mixer app. If its target output is
-  missing, the sink stays silent instead of playing elsewhere.
-- **Limit:** when the service stops, crashes, or restarts (unplug, profile
-  change), the Loudness sink disappears and WirePlumber moves apps that were
-  playing into it to another output, at their normal level, without
-  compensation. If other outputs with speakers are connected, set their
-  PipeWire profile to "Off" so that this fallback can only reach the 4i4.
+- The Loudness sink exists only while the 4i4 and its output exist, and it
+  only ever plays into the 4i4 (no fallback to another output, can't be moved
+  in a mixer app). Unplug the 4i4 or switch its profile off, and the sink is
+  removed within a second, so PipeWire picks an output exactly as it would
+  without this tool; plug it back in and the sink returns.
+- When the service stops, the sink disappears the same way.
 - The compensation assumes the reference listening level stays fixed: after
   `calibrate`, leave the software volumes (apps, EasyEffects, sinks) alone and
   use only the knob.

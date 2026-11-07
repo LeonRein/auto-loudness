@@ -209,7 +209,7 @@ def find_card(name):
         m = re.match(r"\s*(\d+) \[.*\]: .* - (.*)$", line)
         if m and m[2].strip() == name:
             return int(m[1])
-    sys.exit(f"sound card {name!r} not found")
+    return None
 
 
 def parse_amixer(out):
@@ -224,18 +224,29 @@ def parse_amixer(out):
 
 
 def read_knob(card, control):
+    """Knob position in dB, or None if the control can't be read (unplugged, MSD mode)."""
     try:
-        out = sp.check_output(["amixer", "-c", str(card), "cget", f"name={control}"], text=True)
+        out = sp.check_output(["amixer", "-c", str(card), "cget", f"name={control}"], text=True,
+                              stderr=sp.DEVNULL)
     except sp.CalledProcessError:
-        sys.exit(f"cannot read {control!r} on card {card}: device unplugged, or MSD mode still on "
-                 f"(fix: amixer -c {card} cset name='MSD Mode Switch' off, then power-cycle the interface)")
+        return None
     return parse_amixer(out)
+
+
+def knob_error(card, control):
+    return (f"cannot read {control!r} on card {card}: device unplugged, or MSD mode still on "
+            f"(fix: amixer -c {card} cset name='MSD Mode Switch' off, then power-cycle the interface)")
 
 
 def calibrate():
     """Store the current knob position as the reference (flat) position."""
     cfg = load_config()
-    knob = read_knob(find_card(cfg["card"]), cfg["control"])
+    card = find_card(cfg["card"])
+    if card is None:
+        sys.exit(f"sound card {cfg['card']!r} not found")
+    knob = read_knob(card, cfg["control"])
+    if knob is None:
+        sys.exit(knob_error(card, cfg["control"]))
     line = f"ref_knob_db = {knob:.1f}"
     text = CONFIG.read_text() if CONFIG.exists() else ""
     if re.search(r"(?m)^ref_knob_db\s*=", text):
@@ -322,27 +333,15 @@ def set_params(node_id, knob, cfg):
     log(knob, gains, mult, cfg["eq"])
 
 
-def main():
-    if sys.argv[1:] == ["calibrate"]:
-        return calibrate()
-    if sys.argv[1:]:
-        sys.exit("usage: auto-loudness [calibrate]")
-    cfg = load_config()
-    card = find_card(cfg["card"])
-    knob = read_knob(card, cfg["control"])  # fail early with a clear message
-    target = cfg["target"] or find_target(cfg["card"], pw_nodes())
-    if not target:
-        sys.exit(f"no PipeWire output of {cfg['card']!r} found")
-    if "XDG_RUNTIME_DIR" not in os.environ:
-        sys.exit("XDG_RUNTIME_DIR not set: run as a systemd user service or in a login session")
-    conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
+def run(cfg, card, target, knob):
+    """Run the Loudness sink until the 4i4 or its output goes away; returns the reason."""
     gains, mult = eq_params(knob, cfg)
+    conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
     conf.write_text(filter_chain_conf(target, cfg["eq"], gains, mult))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     chain = monitor = None
     try:
         chain = sp.Popen(["pipewire", "-c", str(conf)])
-        monitor = sp.Popen(["alsactl", "monitor", f"hw:{card}"], stdout=sp.PIPE)
+        monitor = sp.Popen(["alsactl", "monitor", f"hw:{card}"], stdout=sp.PIPE, stderr=sp.DEVNULL)
         for _ in range(50):
             node = pw_nodes().get(SINK_NAME)
             if node:
@@ -357,15 +356,18 @@ def main():
             # events give instant updates; the 1 s timeout is a polling fallback
             if select.select([monitor.stdout], [], [], 1.0)[0]:
                 if not os.read(monitor.stdout.fileno(), 4096):
-                    sys.exit("alsactl monitor exited (device unplugged?)")
+                    return "4i4 disconnected"
             nodes = pw_nodes()
             # the pipewire child keeps running even when its filter-chain module is gone
             if SINK_NAME not in nodes:
                 sys.exit("Loudness sink vanished")
-            current = cfg["target"] or find_target(cfg["card"], nodes) or target
-            if current != target:
-                sys.exit(f"output renamed to {current} (profile change?), restarting")
+            # output gone (profile off, unplug) or renamed (profile change): drop the sink so
+            # PipeWire picks an output as if this tool didn't exist; come back with the 4i4
+            if target not in nodes or (cfg["target"] or find_target(cfg["card"], nodes)) != target:
+                return f"output {target} gone"
             new = read_knob(card, cfg["control"])
+            if new is None:
+                return "4i4 disconnected"
             if new != knob:
                 knob = new
                 set_params(node["id"], knob, cfg)
@@ -374,6 +376,40 @@ def main():
         for p in (monitor, chain):
             if p:
                 p.terminate()
+                p.wait(timeout=5)
+
+
+def main():
+    if sys.argv[1:] == ["calibrate"]:
+        return calibrate()
+    if sys.argv[1:]:
+        sys.exit("usage: auto-loudness [calibrate]")
+    cfg = load_config()
+    if "XDG_RUNTIME_DIR" not in os.environ:
+        sys.exit("XDG_RUNTIME_DIR not set: run as a systemd user service or in a login session")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    waiting, misses = False, 0
+    while True:
+        # without the 4i4 there is no Loudness sink at all: PipeWire behaves as without this tool
+        card = find_card(cfg["card"])
+        nodes = pw_nodes()
+        target = cfg["target"] or find_target(cfg["card"], nodes)
+        if card is None or not target or target not in nodes:
+            if not waiting:
+                print(f"waiting for {cfg['card']} and its PipeWire output", flush=True)
+                waiting = True
+            time.sleep(1)
+            continue
+        waiting = False
+        knob = read_knob(card, cfg["control"])
+        if knob is None:  # may just be an unplug in progress; persistent means MSD mode
+            misses += 1
+            if misses >= 5:
+                sys.exit(knob_error(card, cfg["control"]))
+            time.sleep(1)
+            continue
+        misses = 0
+        print(run(cfg, card, target, knob), flush=True)
 
 
 if __name__ == "__main__":
