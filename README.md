@@ -38,19 +38,27 @@ systemctl --user enable --now auto-loudness
 Then send audio to the **Loudness** sink (e.g. set it as EasyEffects' output
 device, or as the default sink).
 
-## Calibrate
+## Configure
 
-1. `journalctl --user -fu auto-loudness` shows the knob position in dB.
-2. Turn the knob to where music sounds right at a loud listening level.
-3. Put that value into `~/.config/auto-loudness/config.toml` and restart the
-   service:
+Turn the knob to where music sounds right at a loud listening level, then:
 
-```toml
-ref_knob_db = -20.0     # knob position for a flat response
-low_hz = 40.0           # no extra bass below this
-# card = "Scarlett 4i4 4th Gen"
-# target = ""           # PipeWire sink node.name; "" = first sink of the card
+```sh
+auto-loudness calibrate
 ```
+
+This stores the knob position as `ref_knob_db` in
+`~/.config/auto-loudness/config.toml` (flat response there, compensation
+below) and restarts the service. `journalctl --user -fu auto-loudness` shows
+what it does. All options, with defaults, are in
+[`config.example.toml`](config.example.toml) (installed to
+`/usr/share/doc/auto-loudness/`); after editing the file run
+`systemctl --user restart auto-loudness`.
+
+Also needed once:
+- Route audio through the **Loudness** sink (EasyEffects output device or
+  default sink).
+- Set the 4i4's PipeWire profile to stereo or Pro Audio.
+- MSD mode off (new interfaces ship with it on; auto-loudness tells you how).
 
 ## Develop
 

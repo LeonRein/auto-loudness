@@ -153,7 +153,28 @@ def parse_amixer(out):
 
 
 def read_knob(card, control):
-    return parse_amixer(sp.check_output(["amixer", "-c", str(card), "cget", f"name={control}"], text=True))
+    try:
+        out = sp.check_output(["amixer", "-c", str(card), "cget", f"name={control}"], text=True)
+    except sp.CalledProcessError:
+        sys.exit(f"cannot read {control!r} on card {card}: device unplugged, or MSD mode still on "
+                 f"(fix: amixer -c {card} cset name='MSD Mode Switch' off, then power-cycle the interface)")
+    return parse_amixer(out)
+
+
+def calibrate():
+    """Store the current knob position as the reference (flat) position."""
+    cfg = load_config()
+    knob = read_knob(find_card(cfg["card"]), cfg["control"])
+    line = f"ref_knob_db = {knob:.1f}"
+    text = CONFIG.read_text() if CONFIG.exists() else ""
+    if re.search(r"(?m)^ref_knob_db\s*=", text):
+        text = re.sub(r"(?m)^ref_knob_db\s*=.*$", line, text)
+    else:
+        text += ("\n" if text and not text.endswith("\n") else "") + line + "\n"
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG.write_text(text)
+    print(f"{CONFIG}: {line}")
+    sp.run(["systemctl", "--user", "try-restart", "auto-loudness.service"])
 
 
 def pw_nodes():
@@ -224,8 +245,13 @@ def set_params(node_id, knob, cfg):
 
 
 def main():
+    if sys.argv[1:] == ["calibrate"]:
+        return calibrate()
+    if sys.argv[1:]:
+        sys.exit("usage: auto-loudness [calibrate]")
     cfg = load_config()
     card = find_card(cfg["card"])
+    knob = read_knob(card, cfg["control"])  # fail early with a clear message
     target = cfg["target"] or find_target(cfg["card"])
     conf = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "auto-loudness.conf"
     conf.write_text(filter_chain_conf(target))
@@ -241,7 +267,6 @@ def main():
         else:
             sys.exit("filter-chain sink did not appear")
         print(f"card {card}, target {target}", flush=True)
-        knob = read_knob(card, cfg["control"])
         set_params(node["id"], knob, cfg)
 
         while chain.poll() is None:

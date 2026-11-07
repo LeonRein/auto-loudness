@@ -1,0 +1,15 @@
+# ~/.config/auto-loudness/config.toml
+# After editing: systemctl --user restart auto-loudness
+
+# Knob position (dB) at which music sounds right at a loud level: flat response there,
+# loudness compensation below. Easiest: turn the knob there and run `auto-loudness calibrate`.
+ref_knob_db = 0.0
+
+# No extra bass below this frequency (set to your speakers' lower limit).
+#low_hz = 40.0
+
+# Interface name as listed in /proc/asound/cards.
+#card = "Scarlett 4i4 4th Gen"
+
+# PipeWire sink node.name to play into; empty = first output of the card.
+#target = ""
