@@ -6,20 +6,23 @@ the knob, the more the mids are lowered relative to bass and treble, so music ke
 low volume.
 
 ```
-apps ─▶ EasyEffects (room EQ) ─▶ "Loudness" sink ─▶ Scarlett 4i4 ─▶ knob ─▶ speakers
-                                      ▲                              │
-                                      └──── auto-loudness reads ─────┘
+apps ─▶ "Loudness" sink (room EQ + loudness) ─▶ Scarlett 4i4 ─▶ knob ─▶ speakers
+                ▲                                                 │
+                └──────────── auto-loudness reads ────────────────┘
 ```
 
 - The knob is read from the ALSA control `Master HW Playback Volume`
   (scarlett2 kernel driver, read-only; needs MSD mode off).
+- An optional fixed EQ from the config (`[[eq]]`, e.g. room correction) runs in
+  the same filter: no EasyEffects needed, which saves one PipeWire cycle of
+  latency (1.3 ms at a 64-sample quantum, 21 ms at the default 1024).
 - From the knob position it computes the ISO 226:2023 equal-loudness
   difference to the reference level and fits a 10-band EQ (PipeWire builtin
   biquads in a filter-chain that auto-loudness runs as a child process,
   updated live via `pw-cli`).
-- **The EQ only cuts, it never boosts.** The bass stays at its original level
-  and the mids/treble are lowered, so the output is never louder than without
-  the tool. If the tool stops, the level can only rise to what the knob alone
+- **The total response never exceeds 0 dB.** The loudness part only cuts (bass
+  stays, mids/treble are lowered), and boosts in the user EQ are offset by a
+  lower output gain, so the output is never louder than without the tool. If the tool stops, the level can only rise to what the knob alone
   gives; at the reference position nothing changes at all.
 - Below `low_hz` (default 40 Hz) no extra bass is added: small monitors can't
   play it, and it would only cost woofer excursion.
@@ -28,9 +31,9 @@ apps ─▶ EasyEffects (room EQ) ─▶ "Loudness" sink ─▶ Scarlett 4i4 ─
   missing, the sink stays silent instead of playing elsewhere.
 - **Limit:** when the service stops, crashes, or restarts (unplug, profile
   change), the Loudness sink disappears and WirePlumber moves apps that were
-  playing into it to the default sink, at their normal level, without
-  compensation. Make the 4i4 the default sink so that this fallback goes where
-  the speakers are.
+  playing into it to another output, at their normal level, without
+  compensation. If other outputs with speakers are connected, set their
+  PipeWire profile to "Off" so that this fallback can only reach the 4i4.
 - The compensation assumes the reference listening level stays fixed: after
   `calibrate`, leave the software volumes (apps, EasyEffects, sinks) alone and
   use only the knob.
@@ -44,8 +47,7 @@ paru -S auto-loudness
 systemctl --user enable --now auto-loudness
 ```
 
-Then send audio to the **Loudness** sink (e.g. set it as EasyEffects' output
-device, or as the default sink).
+Then make **Loudness** the default sink (see Configure).
 
 ## Configure
 
@@ -64,8 +66,8 @@ what it does. All options, with defaults, are in
 `systemctl --user restart auto-loudness`.
 
 Also needed once:
-- Route audio through the **Loudness** sink (EasyEffects output device or
-  default sink).
+- Route audio through the **Loudness** sink: make it the default sink, or
+  select it as EasyEffects' output device if you keep EasyEffects.
 - Set the 4i4's PipeWire profile to stereo or Pro Audio.
 - MSD mode off (new interfaces ship with it on; auto-loudness tells you how).
 

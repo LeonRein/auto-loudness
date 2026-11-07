@@ -26,7 +26,9 @@ DEFAULTS = {
     "ref_knob_db": 0.0,    # knob position (dB) at which music sounds "right" -> flat response
     "low_hz": 40.0,        # no extra bass below this (speaker limit; saves woofer excursion)
     "strength": 1.0,       # 1 = full ISO 226 compensation, smaller = gentler, 0 = off
+    "eq": [],              # fixed user EQ (e.g. room correction): [[eq]] tables, see config.example.toml
 }
+EQ_TYPES = ("peaking", "lowshelf", "highshelf", "lowpass", "highpass")
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auto-loudness/config.toml"
 SINK_NAME = "auto_loudness"
 
@@ -90,21 +92,36 @@ def interp(f, xs, ys):
     return ys[i - 1] + t * (ys[i] - ys[i - 1])
 
 
-def peaking_db(f, f0, gain):
-    """Magnitude (dB) of an RBJ peaking biquad, as used by PipeWire's bq_peaking."""
-    a, w0 = 10 ** (gain / 40), 2 * math.pi * f0 / RATE
-    alpha = math.sin(w0) / (2 * Q)
+def biquad_db(f, kind, f0, q, gain=0.0):
+    """Magnitude (dB) at f of PipeWire's bq_<kind> (RBJ cookbook, same formulas as its biquad.c)."""
+    w0 = 2 * math.pi * f0 / RATE
+    alpha, k, a = math.sin(w0) / (2 * q), math.cos(w0), 10 ** (gain / 40)
+    k2 = 2 * math.sqrt(a) * alpha
+    b, d = {
+        "peaking": ((1 + alpha * a, -2 * k, 1 - alpha * a), (1 + alpha / a, -2 * k, 1 - alpha / a)),
+        "lowshelf": ((a * (a + 1 - (a - 1) * k + k2), 2 * a * (a - 1 - (a + 1) * k), a * (a + 1 - (a - 1) * k - k2)),
+                     (a + 1 + (a - 1) * k + k2, -2 * (a - 1 + (a + 1) * k), a + 1 + (a - 1) * k - k2)),
+        "highshelf": ((a * (a + 1 + (a - 1) * k + k2), -2 * a * (a - 1 + (a + 1) * k), a * (a + 1 + (a - 1) * k - k2)),
+                      (a + 1 - (a - 1) * k + k2, 2 * (a - 1 - (a + 1) * k), a + 1 - (a - 1) * k - k2)),
+        "lowpass": (((1 - k) / 2, 1 - k, (1 - k) / 2), (1 + alpha, -2 * k, 1 - alpha)),
+        "highpass": (((1 + k) / 2, -(1 + k), (1 + k) / 2), (1 + alpha, -2 * k, 1 - alpha)),
+    }[kind]
     z = cmath.exp(-1j * 2 * math.pi * f / RATE)
-    b = (1 + alpha * a) - 2 * math.cos(w0) * z + (1 - alpha * a) * z * z
-    d = (1 + alpha / a) - 2 * math.cos(w0) * z + (1 - alpha / a) * z * z
-    return 20 * math.log10(abs(b / d))
+    h = (b[0] + b[1] * z + b[2] * z * z) / (d[0] + d[1] * z + d[2] * z * z)
+    return 20 * math.log10(max(abs(h), 1e-12))
 
 
-def response(f, gains):
-    return sum(peaking_db(f, f0, g) for f0, g in zip(BANDS, gains))
+def peaking_db(f, f0, gain):
+    return biquad_db(f, "peaking", f0, Q, gain)
 
 
-GRID = [20 * 1000 ** (i / 99) for i in range(100)]  # 20 Hz .. 20 kHz
+def response(f, gains, eq=()):
+    """Total response (dB): loudness bands plus the fixed user EQ."""
+    return (sum(peaking_db(f, f0, g) for f0, g in zip(BANDS, gains))
+            + sum(biquad_db(f, b["type"], b["freq"], b["q"], b["gain"]) for b in eq))
+
+
+GRID = [20 * 1000 ** (i / 999) for i in range(1000)]  # 20 Hz .. 20 kHz, 1/100 octave
 
 
 def solve(a, b):
@@ -136,8 +153,9 @@ def eq_params(knob_db, cfg):
         ata = [[sum(row[i] * row[j] for row in m) + (1e-3 if i == j else 0) for j in range(n)] for i in range(n)]
         atr = [sum(row[i] * x for row, x in zip(m, r)) for i in range(n)]
         gains = [g + d for g, d in zip(gains, solve(ata, atr))]
-    peak = max(response(f, gains) for f in GRID)
-    if any(abs(g) > 1e-6 for g in gains):
+    eq = cfg["eq"]
+    peak = max(response(f, gains, eq) for f in GRID + [b["freq"] for b in eq])
+    if eq or any(abs(g) > 1e-6 for g in gains):
         peak += 0.01  # margin for peaks between grid points
     return gains, 10 ** (-max(0.0, peak) / 20)  # guarantees the whole response stays <= 0 dB
 
@@ -150,7 +168,10 @@ def load_config():
         unknown = user.keys() - DEFAULTS.keys()
         if unknown:
             sys.exit(f"{CONFIG}: unknown keys {sorted(unknown)}")
+        user["eq"] = check_eq(user.get("eq", []))
         for k, v in user.items():
+            if k == "eq":
+                continue
             want_str = isinstance(DEFAULTS[k], str)
             if (isinstance(v, str) != want_str) or isinstance(v, bool) or not isinstance(v, (str, int, float)):
                 sys.exit(f"{CONFIG}: {k} must be {'a string' if want_str else 'a number'}")
@@ -158,6 +179,29 @@ def load_config():
             sys.exit(f"{CONFIG}: target must not contain quotes or backslashes")
         cfg.update(user)
     return cfg
+
+
+def check_eq(eq):
+    """Validate the [[eq]] tables and fill in defaults (q 0.707, gain 0)."""
+    def num(b, i, key, lo, hi, default):
+        v = b.get(key, default)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not lo <= v <= hi:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: {key} must be a number from {lo} to {hi}")
+        return float(v)
+
+    if not isinstance(eq, list) or not all(isinstance(b, dict) for b in eq):
+        sys.exit(f"{CONFIG}: eq must be a list of [[eq]] tables")
+    out = []
+    for i, b in enumerate(eq):
+        if b.keys() - {"type", "freq", "q", "gain"}:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: unknown keys {sorted(b.keys() - {'type', 'freq', 'q', 'gain'})}")
+        if b.get("type") not in EQ_TYPES:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: type must be one of {', '.join(EQ_TYPES)}")
+        if b["type"] in ("lowpass", "highpass") and "gain" in b:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: {b['type']} has no gain")
+        out.append({"type": b["type"], "freq": num(b, i, "freq", 10, 20000, None),
+                    "q": num(b, i, "q", 0.1, 10, 0.707), "gain": num(b, i, "gain", -24, 24, 0.0)})
+    return out
 
 
 def find_card(name):
@@ -222,11 +266,13 @@ def pw_params(gains, mult):
     return " ".join(f'"eq{i}:Gain" {g:.3f}' for i, g in enumerate(gains)) + f' "out:Mult" {mult:.6f}'
 
 
-def filter_chain_conf(target):
-    eqs = "\n".join(f'          {{ type = builtin name = eq{i} label = bq_peaking '
-                    f'control = {{ "Freq" = {f} "Q" = {Q} "Gain" = 0.0 }} }}'
-                    for i, f in enumerate(BANDS))
-    names = [f"eq{i}" for i in range(len(BANDS))] + ["out"]
+def filter_chain_conf(target, eq, gains, mult):
+    """Graph: user EQ (fixed) -> loudness bands -> output gain, all starting at their real values."""
+    nodes = [(f"u{i}", b["type"], b["freq"], b["q"], b["gain"]) for i, b in enumerate(eq)]
+    nodes += [(f"eq{i}", "peaking", f, Q, g) for i, (f, g) in enumerate(zip(BANDS, gains))]
+    eqs = "\n".join(f'          {{ type = builtin name = {n} label = bq_{t} '
+                    f'control = {{ "Freq" = {f} "Q" = {q} "Gain" = {g:.3f} }} }}' for n, t, f, q, g in nodes)
+    names = [n[0] for n in nodes] + ["out"]
     links = "\n".join(f'          {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in zip(names, names[1:]))
     return f"""
 context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }}
@@ -241,12 +287,12 @@ context.modules = [
       filter.graph = {{
         nodes = [
 {eqs}
-          {{ type = builtin name = out label = linear control = {{ "Mult" = 1.0 "Add" = 0.0 }} }}
+          {{ type = builtin name = out label = linear control = {{ "Mult" = {mult:.6f} "Add" = 0.0 }} }}
         ]
         links = [
 {links}
         ]
-        inputs = [ "eq0:In" ]
+        inputs = [ "{names[0]}:In" ]
         outputs = [ "out:Out" ]
       }}
       audio.channels = 2
@@ -263,13 +309,17 @@ context.modules = [
 """
 
 
+def log(knob, gains, mult, eq):
+    db = 20 * math.log10(mult)
+    print(f"knob {knob:+.1f} dB -> " + ", ".join(f"{name} {response(f, gains, eq) + db:+.1f} dB" for name, f in
+                                                 (("40 Hz", 40), ("1 kHz", 1000), ("10 kHz", 10000))), flush=True)
+
+
 def set_params(node_id, knob, cfg):
     gains, mult = eq_params(knob, cfg)
     sp.run(["pw-cli", "set-param", str(node_id), "Props", f"{{ params = [ {pw_params(gains, mult)} ] }}"],
            check=True, stdout=sp.DEVNULL)
-    db = 20 * math.log10(mult)
-    print(f"knob {knob:+.1f} dB -> 40 Hz {response(40, gains) + db:+.1f} dB, "
-          f"1 kHz {response(1000, gains) + db:+.1f} dB, 10 kHz {response(10000, gains) + db:+.1f} dB", flush=True)
+    log(knob, gains, mult, cfg["eq"])
 
 
 def main():
@@ -286,7 +336,8 @@ def main():
     if "XDG_RUNTIME_DIR" not in os.environ:
         sys.exit("XDG_RUNTIME_DIR not set: run as a systemd user service or in a login session")
     conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
-    conf.write_text(filter_chain_conf(target))
+    gains, mult = eq_params(knob, cfg)
+    conf.write_text(filter_chain_conf(target, cfg["eq"], gains, mult))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     chain = monitor = None
     try:
@@ -299,8 +350,8 @@ def main():
             time.sleep(0.1)
         else:
             sys.exit("filter-chain sink did not appear")
-        print(f"card {card}, target {target}", flush=True)
-        set_params(node["id"], knob, cfg)
+        print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands", flush=True)
+        log(knob, gains, mult, cfg["eq"])
 
         while chain.poll() is None:
             # events give instant updates; the 1 s timeout is a polling fallback

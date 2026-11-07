@@ -16,3 +16,19 @@ ref_knob_db = 0.0
 
 # PipeWire sink node.name to play into; empty = first output of the card.
 #target = ""
+
+# Fixed EQ, e.g. room correction, applied together with the loudness compensation.
+# One [[eq]] table per band. type: peaking, lowshelf, highshelf, lowpass, highpass
+# freq in Hz (10-20000), q (0.1-10, default 0.707), gain in dB (-24..24; not for lowpass/highpass).
+# Boosts are fine: the output gain is lowered automatically so the total never exceeds 0 dB,
+# so no manual preamp is needed. Restart the service after changes.
+#[[eq]]
+#type = "peaking"
+#freq = 356
+#q = 0.49
+#gain = 2.4
+#
+#[[eq]]
+#type = "highpass"   # protect small speakers from sub-bass
+#freq = 35
+#q = 0.6
