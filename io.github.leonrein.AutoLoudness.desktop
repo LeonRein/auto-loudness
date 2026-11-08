@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Loudness
+Comment=Show the loudness compensation curve for the current knob position
+Exec=auto-loudness gui
+Icon=audio-speakers-symbolic
+Categories=AudioVideo;Audio;
+Keywords=loudness;equalizer;eq;scarlett;
+StartupNotify=true

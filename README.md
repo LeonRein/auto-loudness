@@ -69,6 +69,15 @@ Also needed once:
 - Set the 4i4's PipeWire profile to stereo or Pro Audio.
 - MSD mode off (new interfaces ship with it on; auto-loudness tells you how).
 
+## Filter curve
+
+**Loudness** in the app menu (or `auto-loudness gui`) opens a window with the
+response the service applies at the current knob position, loudness plus user
+EQ, and follows the knob while open. It only reads the config and the knob:
+nothing in the audio path changes, and nothing runs while it is closed. It
+needs `python-gobject`, `gtk4` and `libadwaita`. It shows the config as it is
+on disk, so after editing it restart the service to make both agree.
+
 ## Develop
 
 ```sh
