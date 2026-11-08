@@ -44,6 +44,8 @@ class Test(unittest.TestCase):
         err = max(abs(response(f, gains) + gain_db - interp(f, ISO_F, target))
                   for f in ISO_F if 31.5 <= f <= 12500)
         self.assertLess(err, 1.5)
+        top = max(response(f, gains) + gain_db for f in GRID if f > 12500)
+        self.assertLess(top - target[-1], 0.5)  # holds above 12.5 kHz, no spring back
 
     def test_strength(self):
         full, half = target_gains(-20, 40, 1.0), target_gains(-20, 40, 0.5)

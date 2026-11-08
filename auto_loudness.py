@@ -45,8 +45,10 @@ ISO_TF = [78.1, 68.7, 59.5, 51.1, 44.0, 37.5, 31.5, 26.5, 22.1, 17.9, 14.4, 11.4
 REF_PHON = 80.0   # listening level at ref_knob_db; the curve shape barely depends on it
 MIN_PHON = 20.0   # ISO 226 is defined from 20 phon up
 
-BANDS = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]  # octave peaking EQ
-Q = 0.7  # wide, overlapping bands sum without ripple; the least-squares fit handles the overlap
+# Octave peaking bands, Q 0.7: wide and overlapping, the least-squares fit handles the overlap.
+# The top band is a high shelf so the cut holds up to 20 kHz like the norm's 12.5 kHz value;
+# a 16 kHz peak sprang back above it (up to +10 dB at 20 kHz when turned down far).
+BANDS = [("peaking", f, 0.7) for f in (31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000)] + [("highshelf", 14000, 0.6)]
 RATE = 48000  # shortcut: fit assumes 48 kHz; at 44.1 kHz the top band shifts slightly, harmless
 
 
@@ -111,13 +113,9 @@ def biquad_db(f, kind, f0, q, gain=0.0):
     return 20 * math.log10(max(abs(h), 1e-12))
 
 
-def peaking_db(f, f0, gain):
-    return biquad_db(f, "peaking", f0, Q, gain)
-
-
 def response(f, gains, eq=()):
     """Total response (dB): loudness bands plus the fixed user EQ."""
-    return (sum(peaking_db(f, f0, g) for f0, g in zip(BANDS, gains))
+    return (sum(biquad_db(f, kind, f0, q, g) for (kind, f0, q), g in zip(BANDS, gains))
             + sum(biquad_db(f, b["type"], b["freq"], b["q"], b["gain"]) for b in eq))
 
 
@@ -146,7 +144,7 @@ def eq_params(knob_db, cfg):
                           min(1.0, max(0.0, cfg["strength"])))
     pts, want = ISO_F + [16000], target + [target[-1]]  # hold the 12.5 kHz value above
     # least squares on the overlapping bands; a few Gauss-Newton steps fix the slight non-linearity
-    m = [[peaking_db(f, f0, 1.0) for f0 in BANDS] for f in pts]
+    m = [[biquad_db(f, kind, f0, q, 1.0) for kind, f0, q in BANDS] for f in pts]
     n, gains = len(BANDS), [0.0] * len(BANDS)
     for _ in range(5):
         r = [w - response(f, gains) for f, w in zip(pts, want)]
@@ -280,7 +278,7 @@ def filter_chain_conf(target, eq, gains, mult):
     values go to the silent chain, which is then crossfaded in (see Fader)."""
     nodes = [(f"u{i}", b["type"], b["freq"], b["q"], b["gain"]) for i, b in enumerate(eq)]
     for c in "ab":
-        nodes += [(f"{c}{i}", "peaking", f, Q, g) for i, (f, g) in enumerate(zip(BANDS, gains))]
+        nodes += [(f"{c}{i}", kind, f, q, g) for i, ((kind, f, q), g) in enumerate(zip(BANDS, gains))]
     eqs = "\n".join(f'          {{ type = builtin name = {n} label = bq_{t} '
                     f'control = {{ "Freq" = {f} "Q" = {q} "Gain" = {g:.3f} }} }}' for n, t, f, q, g in nodes)
     pre = ["in"] + [f"u{i}" for i in range(len(eq))]
