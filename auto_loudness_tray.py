@@ -8,6 +8,7 @@ or a double click, opens the curve window (auto-loudness gui).
 """
 import math
 import os
+import signal
 import subprocess as sp
 import sys
 from pathlib import Path
@@ -214,5 +215,12 @@ class Tray:
 
 
 def main():
-    tray = Tray()  # noqa: F841 (kept alive by the main loop's callbacks)
-    GLib.MainLoop().run()
+    tray, loop = Tray(), GLib.MainLoop()
+
+    def stop():  # end the pactl child too, it would otherwise linger until the next event
+        tray.events.terminate()
+        loop.quit()
+        return False
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, stop)
+    loop.run()

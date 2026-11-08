@@ -42,10 +42,12 @@ From the [leonrein paru repository](https://github.com/LeonRein/paru-repository)
 
 ```sh
 paru -S auto-loudness
-systemctl --user enable --now auto-loudness
+systemctl --user start auto-loudness   # only now; from then on it starts with PipeWire
 ```
 
-Then make **Loudness** the default sink (see Configure).
+Then make **Loudness** the default sink (see Configure). The package enables the
+service for every user (it starts with PipeWire); to opt out, run
+`systemctl --user mask auto-loudness`.
 
 ## Configure
 
@@ -80,15 +82,15 @@ on disk, so after editing it restart the service to make both agree.
 
 ## Panel icon
 
-```sh
-systemctl --user enable --now auto-loudness-tray
-```
-
-shows an icon in the top bar (GNOME needs the AppIndicator extension): bright
+From the next login on, an icon in the top bar (GNOME needs the AppIndicator
+extension; start it right away with `gio launch
+/etc/xdg/autostart/auto-loudness-tray.desktop`) shows the state: bright
 when **Loudness** is the default output, dimmed when another output is picked
 and audio bypasses it, hidden when there is no Loudness sink. Its menu, or a
 double click, opens the filter curve. It only wakes on sound server events, so
 it uses no CPU while idle. Needs `python-gobject` and `libpulse` (for `pactl`).
+It is a normal autostart entry, so it can be switched off per user in GNOME
+Tweaks (Startup Applications).
 
 ## Develop
 
