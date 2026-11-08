@@ -380,6 +380,7 @@ def run(cfg, card, target, knob):
         print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands", flush=True)
         log(knob, gains, mult, cfg["eq"])
         fader = Fader(node["id"], mult)
+        logged, changed = knob, 0.0
 
         while chain.poll() is None:
             # events give instant updates; the 1 s timeout is a polling fallback
@@ -401,6 +402,10 @@ def run(cfg, card, target, knob):
                 knob = new
                 gains, mult = eq_params(knob, cfg)
                 fader.apply(gains, mult)
+                changed = time.monotonic()
+            # log only where the knob comes to rest, not every step of a turn
+            if knob != logged and time.monotonic() - changed >= 1.0:
+                logged = knob
                 log(knob, gains, mult, cfg["eq"])
         sys.exit(f"filter-chain exited with {chain.returncode}")
     finally:
