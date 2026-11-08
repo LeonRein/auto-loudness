@@ -45,10 +45,11 @@ ISO_TF = [78.1, 68.7, 59.5, 51.1, 44.0, 37.5, 31.5, 26.5, 22.1, 17.9, 14.4, 11.4
 REF_PHON = 80.0   # listening level at ref_knob_db; the curve shape barely depends on it
 MIN_PHON = 20.0   # ISO 226 is defined from 20 phon up
 
-# Octave peaking bands, Q 0.7: wide and overlapping, the least-squares fit handles the overlap.
-# The top band is a high shelf so the cut holds up to 20 kHz like the norm's 12.5 kHz value;
-# a 16 kHz peak sprang back above it (up to +10 dB at 20 kHz when turned down far).
-BANDS = [("peaking", f, 0.7) for f in (31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000)] + [("highshelf", 14000, 0.6)]
+# Half-octave peaking bands, Q 1.0: overlapping, the least-squares fit handles the overlap.
+# Octave bands rippled ±0.7 dB between the ISO points when turned down far; these ±0.2 dB.
+# The top band is a high shelf so the cut holds up to 20 kHz like the norm's 12.5 kHz value
+# (a peak there springs back, up to +10 dB at 20 kHz).
+BANDS = [("peaking", round(31.5 * 2 ** (i / 2), 1), 1.0) for i in range(18)] + [("highshelf", 14000, 0.7)]
 RATE = 48000  # shortcut: fit assumes 48 kHz; at 44.1 kHz the top band shifts slightly, harmless
 
 
@@ -142,7 +143,10 @@ def eq_params(knob_db, cfg):
     """Knob position -> (band gains in dB, linear output gain <= 1)."""
     target = target_gains(min(0.0, knob_db - cfg["ref_knob_db"]), cfg["low_hz"],
                           min(1.0, max(0.0, cfg["strength"])))
-    pts, want = ISO_F + [16000], target + [target[-1]]  # hold the 12.5 kHz value above
+    # fit the whole line through the ISO points (1/10 octave steps), not just the points, so it
+    # doesn't ripple between them; hold the 12.5 kHz value above
+    pts = GRID[::10]
+    want = [interp(f, ISO_F + [16000], target + [target[-1]]) for f in pts]
     # least squares on the overlapping bands; a few Gauss-Newton steps fix the slight non-linearity
     m = [[biquad_db(f, kind, f0, q, 1.0) for kind, f0, q in BANDS] for f in pts]
     n, gains = len(BANDS), [0.0] * len(BANDS)
@@ -332,7 +336,7 @@ def log(knob, gains, mult, eq):
 
 class Fader:
     """Click-free updates: retune the silent chain, let it settle, then crossfade to it."""
-    SETTLE = 0.08  # s; lowest band (31.5 Hz, Q 0.7) decays in ~7 ms, plus a quantum or two
+    SETTLE = 0.08  # s; lowest band (31.5 Hz, Q 1.0) decays in ~10 ms, plus a quantum or two
     FADE, STEPS = 0.3, 60  # measured: clicks ~-75 dBFS (hard switch: -47 dBFS)
 
     def __init__(self, node_id, mult):
