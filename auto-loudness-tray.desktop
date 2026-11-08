@@ -3,6 +3,6 @@ Type=Application
 Name=Loudness panel icon
 Comment=Shows whether audio goes through the Loudness sink
 Exec=auto-loudness tray
-Icon=audio-speakers-symbolic
+Icon=io.github.leonrein.AutoLoudness
 NoDisplay=true
 X-GNOME-Autostart-enabled=true

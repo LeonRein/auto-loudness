@@ -68,24 +68,34 @@ def state(default, sinks):
     return "active" if default == core.SINK_NAME else "inactive"
 
 
+def contour_line(phon, x0, x1, y_top, y_bot, lo=14, hi=119):
+    """The ISO 226 contour at `phon`, smoothed, as points in a box (log frequency axis)."""
+    v = core.contour(phon)
+    for _ in range(4):  # soften the table's small wiggles, keep the shape
+        v = [v[0]] + [0.25 * a + 0.5 * b + 0.25 * c for a, b, c in zip(v, v[1:], v[2:])] + [v[-1]]
+    span = math.log(core.ISO_F[-1] / core.ISO_F[0])
+    return [(x0 + (x1 - x0) * math.log(f / core.ISO_F[0]) / span, y_bot - (y_bot - y_top) * (s - lo) / (hi - lo))
+            for f, s in zip(core.ISO_F, v)]
+
+
+def band(points, width):
+    """A polyline as a filled band: symbolic icons get every path filled, so strokes won't do."""
+    up, down = [], []
+    for i, (x, y) in enumerate(points):
+        (ax, ay), (bx, by) = points[max(0, i - 1)], points[min(len(points) - 1, i + 1)]
+        n = math.hypot(bx - ax, by - ay)
+        nx, ny = -(by - ay) / n * width / 2, (bx - ax) / n * width / 2
+        up.append(f"{x + nx:.2f},{y + ny:.2f}")
+        down.append(f"{x - nx:.2f},{y - ny:.2f}")
+    return "M" + " L".join(up + down[::-1]) + " Z"
+
+
 def icon_svg(opacity):
-    """16 px symbolic icon: the loudness 'bathtub' curve as a filled band (symbolic icons are
-    recoloured by filling every path, so a plain stroke would turn into a filled blob)."""
-    def bezier(t):  # (1.5, 2.5) -> (14.5, 5), dipping down like the compensation curve
-        p = [(1.5, 2.5), (4.5, 13.5), (11, 12.5), (14.5, 5)]
-        u = 1 - t
-        return [u ** 3 * a + 3 * u * u * t * b + 3 * u * t * t * c + t ** 3 * d for a, b, c, d in zip(*p)]
-    upper, lower = [], []
-    for i in range(33):
-        t = i / 32
-        (x0, y0), (x1, y1) = bezier(max(0, t - 0.01)), bezier(min(1, t + 0.01))
-        n = math.hypot(x1 - x0, y1 - y0)
-        nx, ny = -(y1 - y0) / n, (x1 - x0) / n
-        x, y = bezier(t)
-        upper.append(f"{x + nx:.2f},{y + ny:.2f}")
-        lower.append(f"{x - nx:.2f},{y - ny:.2f}")
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">'
-            f'<path d="M{" L".join(upper + lower[::-1])} Z" fill="#bebebe" opacity="{opacity}"/></svg>')
+    """16 px symbolic logo: equal-loudness contours at 80 and 20 phon, the quiet one emphasised
+    (the app icon shows three; two stay apart at this size)."""
+    body = "".join(f'<path d="{band(contour_line(phon, 1, 15, 1.5, 14.5), width)}" fill="#bebebe" '
+                   f'opacity="{alpha * opacity:.2f}"/>' for phon, width, alpha in ((80, 1.4, 0.55), (20, 2.2, 1.0)))
+    return f'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">{body}</svg>'
 
 
 def query():
