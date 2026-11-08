@@ -78,6 +78,18 @@ nothing in the audio path changes, and nothing runs while it is closed. It
 needs `python-gobject`, `gtk4` and `libadwaita`. It shows the config as it is
 on disk, so after editing it restart the service to make both agree.
 
+## Panel icon
+
+```sh
+systemctl --user enable --now auto-loudness-tray
+```
+
+shows an icon in the top bar (GNOME needs the AppIndicator extension): bright
+when **Loudness** is the default output, dimmed when another output is picked
+and audio bypasses it, hidden when there is no Loudness sink. Its menu, or a
+double click, opens the filter curve. It only wakes on sound server events, so
+it uses no CPU while idle. Needs `python-gobject` and `libpulse` (for `pactl`).
+
 ## Develop
 
 ```sh

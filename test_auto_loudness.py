@@ -83,6 +83,16 @@ class Test(unittest.TestCase):
                     check_eq(bad)
                 ex.assert_called_once()
 
+    def test_tray_state_and_icon(self):
+        import xml.etree.ElementTree as ET
+        import auto_loudness_tray as tray
+        sinks = {"auto_loudness", "alsa_output.usb-Focusrite"}
+        self.assertEqual(tray.state("auto_loudness", sinks), "active")
+        self.assertEqual(tray.state("alsa_output.usb-Focusrite", sinks), "inactive")  # 4i4 picked directly
+        self.assertEqual(tray.state("alsa_output.usb-Focusrite", {"alsa_output.usb-Focusrite"}), "hidden")
+        self.assertEqual(tray.state("", set()), "hidden")  # no sound server
+        ET.fromstring(tray.icon_svg(0.35))  # well-formed
+
 
 if __name__ == "__main__":
     unittest.main()

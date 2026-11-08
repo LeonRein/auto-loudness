@@ -425,8 +425,11 @@ def main():
     if sys.argv[1:] == ["gui"]:
         import auto_loudness_gui  # GTK only loads here, never in the service
         return auto_loudness_gui.main()
+    if sys.argv[1:] == ["tray"]:
+        import auto_loudness_tray
+        return auto_loudness_tray.main()
     if sys.argv[1:]:
-        sys.exit("usage: auto-loudness [calibrate | gui]")
+        sys.exit("usage: auto-loudness [calibrate | gui | tray]")
     cfg = load_config()
     if "XDG_RUNTIME_DIR" not in os.environ:
         sys.exit("XDG_RUNTIME_DIR not set: run as a systemd user service or in a login session")
