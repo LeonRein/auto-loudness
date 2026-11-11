@@ -5,8 +5,9 @@ import unittest
 from unittest import mock
 
 import auto_loudness
-from auto_loudness import (DEFAULTS, GRID, ISO_F, biquad_db, channel_eq, check_eq, contour, eq_params,
-                           filter_chain_conf, interp, mono_bass_h, parse_amixer, response, target_gains)
+from auto_loudness import (DEFAULTS, GRID, ISO_F, biquad_db, biquad_db_many, channel_eq, check_eq, contour,
+                           eq_params, filter_chain_conf, interp, mono_bass_h, parse_amixer, response,
+                           response_many, target_gains)
 
 AMIXER = """numid=6,iface=MIXER,name='Master HW Playback Volume'
   ; type=INTEGER,access=r----R--,values=1,min=0,max=127,step=1
@@ -62,6 +63,17 @@ class Test(unittest.TestCase):
         self.assertAlmostEqual(biquad_db(1000, "highpass", 1000, 0.707), -3.01, delta=0.05)
         self.assertAlmostEqual(biquad_db(1000, "lowpass", 1000, 0.707), -3.01, delta=0.05)
         self.assertAlmostEqual(biquad_db(500, "peaking", 500, 2, 5), 5, delta=0.01)
+
+    def test_fast_path_matches(self):
+        freqs = tuple(GRID[::7])
+        for kind, f0, q, g in (("peaking", 42, 8, -13.5), ("lowshelf", 200, 0.707, 6), ("highshelf", 14000, 0.7, -8),
+                               ("lowpass", 110, 0.7071, 0), ("highpass", 110, 0.7071, 0)):
+            for f, x in zip(freqs, biquad_db_many(freqs, kind, f0, q, g)):
+                self.assertAlmostEqual(x, biquad_db(f, kind, f0, q, g), places=6)
+        eq = check_eq([{"type": "peaking", "freq": 120, "q": 8, "gain": -12, "channel": "left"}])
+        gains, _ = eq_params(-50, CFG)
+        for f, x in zip(freqs, response_many(freqs, gains, eq)):
+            self.assertAlmostEqual(x, response(f, gains, eq), places=6)
 
     def test_user_eq_never_boosts(self):
         eq = check_eq([{"type": "peaking", "freq": 356, "q": 0.49, "gain": 2.41},

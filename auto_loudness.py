@@ -7,6 +7,7 @@ never boosts: the loudest band sits at 0 dB and the mids are lowered instead,
 so the output can never be louder than with the tool switched off.
 """
 import cmath
+import functools
 import json
 import math
 import os
@@ -107,10 +108,53 @@ def biquad_db(f, kind, f0, q, gain=0.0):
 
 def biquad_h(f, kind, f0, q, gain=0.0):
     """Complex response at f of PipeWire's bq_<kind>."""
+    b, d = coeffs(kind, f0, q, gain)
+    z = cmath.exp(-1j * 2 * math.pi * f / RATE)
+    return (b[0] + b[1] * z + b[2] * z * z) / (d[0] + d[1] * z + d[2] * z * z)
+
+
+@functools.lru_cache(maxsize=None)
+def _phis(freqs):
+    return tuple(math.sin(math.pi * f / RATE) ** 2 for f in freqs)
+
+
+def biquad_db_many(freqs, kind, f0, q, gain=0.0):
+    """biquad_db at many frequencies (a tuple) at once: closed-form |H|^2 in sin^2(w/2), real
+    arithmetic only, several times faster than the complex evaluation point by point."""
+    def terms(c):
+        return (c[0] + c[1] + c[2]) ** 2, 4 * (c[0] * c[1] + 4 * c[0] * c[2] + c[1] * c[2]), 16 * c[0] * c[2]
+    b, d = coeffs(kind, f0, q, gain)
+    (n0, n1, n2), (d0, d1, d2) = terms(b), terms(d)
+    return [10 * math.log10(max((n0 - n1 * p + n2 * p * p) / (d0 - d1 * p + d2 * p * p), 1e-24))
+            for p in _phis(freqs)]
+
+
+@functools.lru_cache(maxsize=64)
+def _fixed_db(freqs, bands):
+    """Summed response (dB) of fixed bands ((type, freq, q, gain), ...) at freqs, cached: the
+    user EQ never changes while the service or the window runs."""
+    total = [0.0] * len(freqs)
+    for b in bands:
+        total = [t + x for t, x in zip(total, biquad_db_many(freqs, *b))]
+    return tuple(total)
+
+
+def response_many(freqs, gains, eq=()):
+    """response() at many frequencies at once."""
+    freqs = tuple(freqs)
+    total = list(_fixed_db(freqs, tuple((b["type"], b["freq"], b["q"], b["gain"]) for b in eq)))
+    for (kind, f0, q), g in zip(BANDS, gains):
+        if g:  # a band at 0 dB is exactly flat
+            total = [t + x for t, x in zip(total, biquad_db_many(freqs, kind, f0, q, g))]
+    return total
+
+
+def coeffs(kind, f0, q, gain=0.0):
+    """RBJ biquad coefficients (b, a), as PipeWire's biquad.c computes them."""
     w0 = 2 * math.pi * f0 / RATE
     alpha, k, a = math.sin(w0) / (2 * q), math.cos(w0), 10 ** (gain / 40)
     k2 = 2 * math.sqrt(a) * alpha
-    b, d = {
+    return {
         "peaking": ((1 + alpha * a, -2 * k, 1 - alpha * a), (1 + alpha / a, -2 * k, 1 - alpha / a)),
         "lowshelf": ((a * (a + 1 - (a - 1) * k + k2), 2 * a * (a - 1 - (a + 1) * k), a * (a + 1 - (a - 1) * k - k2)),
                      (a + 1 + (a - 1) * k + k2, -2 * (a - 1 + (a + 1) * k), a + 1 + (a - 1) * k - k2)),
@@ -119,8 +163,6 @@ def biquad_h(f, kind, f0, q, gain=0.0):
         "lowpass": (((1 - k) / 2, 1 - k, (1 - k) / 2), (1 + alpha, -2 * k, 1 - alpha)),
         "highpass": (((1 + k) / 2, -(1 + k), (1 + k) / 2), (1 + alpha, -2 * k, 1 - alpha)),
     }[kind]
-    z = cmath.exp(-1j * 2 * math.pi * f / RATE)
-    return (b[0] + b[1] * z + b[2] * z * z) / (d[0] + d[1] * z + d[2] * z * z)
 
 
 def mono_bass_h(f, fc, own=1.0, other=0.0):
@@ -143,6 +185,17 @@ def response(f, gains, eq=()):
 
 
 GRID = [20 * 1000 ** (i / 999) for i in range(1000)]  # 20 Hz .. 20 kHz, 1/100 octave
+FIT_PTS = tuple(GRID[::10])  # 1/10 octave: where the loudness fit is evaluated
+
+
+@functools.lru_cache(maxsize=None)
+def _fit_basis():
+    """Jacobian of the loudness bands at FIT_PTS (dB per dB at 1 dB) and its normal matrix."""
+    cols = [biquad_db_many(FIT_PTS, kind, f0, q, 1.0) for kind, f0, q in BANDS]
+    m = [list(row) for row in zip(*cols)]
+    n = len(BANDS)
+    ata = [[sum(row[i] * row[j] for row in m) + (1e-3 if i == j else 0) for j in range(n)] for i in range(n)]
+    return m, ata
 
 
 def solve(a, b):
@@ -167,19 +220,20 @@ def eq_params(knob_db, cfg):
                           min(1.0, max(0.0, cfg["strength"])))
     # fit the whole line through the ISO points (1/10 octave steps), not just the points, so it
     # doesn't ripple between them; hold the 12.5 kHz value above
-    pts = GRID[::10]
+    pts = FIT_PTS
     want = [interp(f, ISO_F + [16000], target + [target[-1]]) for f in pts]
     # least squares on the overlapping bands; a few Gauss-Newton steps fix the slight non-linearity
-    m = [[biquad_db(f, kind, f0, q, 1.0) for kind, f0, q in BANDS] for f in pts]
+    m, ata = _fit_basis()
     n, gains = len(BANDS), [0.0] * len(BANDS)
     for _ in range(5):
-        r = [w - response(f, gains) for f, w in zip(pts, want)]
-        ata = [[sum(row[i] * row[j] for row in m) + (1e-3 if i == j else 0) for j in range(n)] for i in range(n)]
+        r = [w - x for w, x in zip(want, response_many(pts, gains))]
         atr = [sum(row[i] * x for row, x in zip(m, r)) for i in range(n)]
         gains = [g + d for g, d in zip(gains, solve(ata, atr))]
     # one output gain for both channels (keeps the balance); the mono-bass split never boosts
     eq = cfg["eq"]
-    peak = max(response(f, gains, channel_eq(eq, ch)) for _, ch in CHANNELS for f in GRID + [b["freq"] for b in eq])
+    freqs = tuple(GRID + [b["freq"] for b in eq])
+    loud = response_many(freqs, gains)
+    peak = max(x + u for _, ch in CHANNELS for x, u in zip(loud, response_many(freqs, [], channel_eq(eq, ch))))
     if eq or any(abs(g) > 1e-6 for g in gains):
         peak += 0.01  # margin for peaks between grid points
     return gains, 10 ** (-max(0.0, peak) / 20)  # guarantees the whole response stays <= 0 dB

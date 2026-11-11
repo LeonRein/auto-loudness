@@ -20,6 +20,7 @@ APP_ID = "io.github.leonrein.AutoLoudness"  # also the .desktop name; a tray can
 DB_TOP, DB_BOTTOM = 3.0, -30.0
 FREQS = core.GRID[::3]
 X_TICKS = (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
+DASHES = ([], [7, 5])  # left solid, right dashed
 
 
 def curve(knob, cfg):
@@ -27,14 +28,14 @@ def curve(knob, cfg):
     position: [(label, points)], one entry when both speakers get the same EQ."""
     gains, mult = core.eq_params(knob, cfg)
     db = 20 * math.log10(mult)
-    curves = [(ch, [core.response(f, gains, core.channel_eq(cfg["eq"], name)) + db for f in FREQS])
-              for ch, name in core.CHANNELS]
+    curves = [(name, [x + db for x in core.response_many(FREQS, gains, core.channel_eq(cfg["eq"], name))])
+              for _, name in core.CHANNELS]
     return curves if curves[0][1] != curves[1][1] else [("", curves[0][1])]
 
 
 def draw_curve(cr, w, h, curves, fg, accent, message=None):
     """Draw grid, labels and the curves on a cairo context; colours are (r, g, b) tuples.
-    curves: [(label, points)]; a second curve is drawn dashed."""
+    curves: [(label, points)]; with two (left, right speaker) the second is dashed, with a legend."""
     left, right, top, bottom = 44, 12, 12, 26
     pw, ph = w - left - right, h - top - bottom
     x = lambda f: left + pw * math.log(f / 20) / math.log(1000)  # noqa: E731
@@ -71,14 +72,26 @@ def draw_curve(cr, w, h, curves, fg, accent, message=None):
     cr.set_source_rgb(*accent)
     cr.set_line_width(2.5)
     for n, (label, points) in enumerate(curves):
-        cr.set_dash([7, 5] if n else [])
+        cr.set_dash(DASHES[n])
         for i, (f, db) in enumerate(zip(FREQS, points)):
             (cr.line_to if i else cr.move_to)(x(f), y(db))
         cr.stroke()
-        if label:  # name the curve at its left end, where per-speaker room EQs differ most
-            cr.move_to(left + 4 + 14 * n, y(points[0]) - 6)
-            cr.show_text(label)
     cr.restore()
+    if len(curves) > 1:  # legend, bottom right, where the curves rarely are
+        cr.set_font_size(12)
+        for n, (label, _) in enumerate(curves):
+            ly = top + ph - 12 - 18 * (len(curves) - 1 - n)
+            lx = left + pw - 120
+            cr.set_source_rgb(*accent)
+            cr.set_line_width(2.5)
+            cr.set_dash(DASHES[n])
+            cr.move_to(lx, ly - 4)
+            cr.line_to(lx + 34, ly - 4)
+            cr.stroke()
+            cr.set_dash([])
+            cr.set_source_rgba(*fg, 0.85)
+            cr.move_to(lx + 42, ly)
+            cr.show_text(f"{label} speaker")
 
 
 class CurveWindow(Adw.ApplicationWindow):
@@ -88,6 +101,7 @@ class CurveWindow(Adw.ApplicationWindow):
         super().__init__(application=app, title="Loudness", default_width=640, default_height=360)
         self.cfg = core.load_config()
         self.points = self.message = self.monitor = self.watch = None
+        self.refresh_pending = False
         header = Adw.HeaderBar()
         self.area = Gtk.DrawingArea(vexpand=True, hexpand=True)
         self.area.set_draw_func(self.on_draw)
@@ -111,11 +125,23 @@ class CurveWindow(Adw.ApplicationWindow):
                                        GLib.IOCondition.IN | GLib.IOCondition.HUP, self.on_event, card)
 
     def on_event(self, fd, cond, card):
-        if not os.read(fd, 4096) or not self.update(card):  # EOF: interface unplugged
+        if not os.read(fd, 4096):  # EOF: interface unplugged
             self.stop_monitor()
             self.connect_card()
             return False
+        # a turn of the knob fires a burst of events: redraw once, for where the knob is now,
+        # when the main loop is idle, instead of once per event
+        if not self.refresh_pending:
+            self.refresh_pending = True
+            GLib.idle_add(self.on_refresh, card)
         return True
+
+    def on_refresh(self, card):
+        self.refresh_pending = False
+        if self.monitor and not self.update(card):
+            self.stop_monitor()
+            self.connect_card()
+        return False
 
     def update(self, card):
         knob = core.read_knob(card, self.cfg["control"])
