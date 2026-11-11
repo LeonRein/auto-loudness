@@ -23,14 +23,18 @@ X_TICKS = (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
 
 
 def curve(knob, cfg):
-    """Total response in dB at FREQS, exactly what the service applies at this knob position."""
+    """Total response in dB at FREQS per speaker, exactly what the service applies at this knob
+    position: [(label, points)], one entry when both speakers get the same EQ."""
     gains, mult = core.eq_params(knob, cfg)
     db = 20 * math.log10(mult)
-    return [core.response(f, gains, cfg["eq"]) + db for f in FREQS]
+    curves = [(ch, [core.response(f, gains, core.channel_eq(cfg["eq"], name)) + db for f in FREQS])
+              for ch, name in core.CHANNELS]
+    return curves if curves[0][1] != curves[1][1] else [("", curves[0][1])]
 
 
-def draw_curve(cr, w, h, points, fg, accent, message=None):
-    """Draw grid, labels and the curve on a cairo context; colours are (r, g, b) tuples."""
+def draw_curve(cr, w, h, curves, fg, accent, message=None):
+    """Draw grid, labels and the curves on a cairo context; colours are (r, g, b) tuples.
+    curves: [(label, points)]; a second curve is drawn dashed."""
     left, right, top, bottom = 44, 12, 12, 26
     pw, ph = w - left - right, h - top - bottom
     x = lambda f: left + pw * math.log(f / 20) / math.log(1000)  # noqa: E731
@@ -66,9 +70,14 @@ def draw_curve(cr, w, h, points, fg, accent, message=None):
     cr.clip()
     cr.set_source_rgb(*accent)
     cr.set_line_width(2.5)
-    for i, (f, db) in enumerate(zip(FREQS, points)):
-        (cr.line_to if i else cr.move_to)(x(f), y(db))
-    cr.stroke()
+    for n, (label, points) in enumerate(curves):
+        cr.set_dash([7, 5] if n else [])
+        for i, (f, db) in enumerate(zip(FREQS, points)):
+            (cr.line_to if i else cr.move_to)(x(f), y(db))
+        cr.stroke()
+        if label:  # name the curve at its left end, where per-speaker room EQs differ most
+            cr.move_to(left + 4 + 14 * n, y(points[0]) - 6)
+            cr.show_text(label)
     cr.restore()
 
 

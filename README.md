@@ -6,7 +6,7 @@ the knob, the more the mids are lowered relative to bass and treble, so music ke
 low volume.
 
 ```
-apps ─▶ "Loudness" sink (room EQ + loudness) ─▶ Scarlett 4i4 ─▶ knob ─▶ speakers
+apps ─▶ "Loudness" sink (mono bass + room EQ per speaker + loudness) ─▶ Scarlett 4i4 ─▶ knob ─▶ speakers
                 ▲                                                 │
                 └──────────── auto-loudness reads ────────────────┘
 ```
@@ -15,7 +15,12 @@ apps ─▶ "Loudness" sink (room EQ + loudness) ─▶ Scarlett 4i4 ─▶ knob
   (scarlett2 kernel driver, read-only; needs MSD mode off).
 - An optional fixed EQ from the config (`[[eq]]`, e.g. room correction) runs in
   the same filter: no EasyEffects needed, which saves one PipeWire cycle of
-  latency (1.3 ms at a 64-sample quantum, 21 ms at the default 1024).
+  latency (1.3 ms at a 64-sample quantum, 21 ms at the default 1024). Each band
+  acts on both speakers or on one (`channel = "left"` / `"right"`), since room
+  modes differ per speaker position.
+- Optional mono bass (`mono_bass_hz`): below the crossover both speakers play
+  left + right (Linkwitz-Riley 4th order, flat for mono content), which fills
+  room dips that only one speaker has at the listening position.
 - From the knob position it computes the ISO 226:2023 equal-loudness
   difference to the reference level and fits a 10-band EQ (PipeWire builtin
   biquads in a filter-chain that auto-loudness runs as a child process,
@@ -75,7 +80,8 @@ Also needed once:
 
 **Loudness** in the app menu (or `auto-loudness gui`) opens a window with the
 response the service applies at the current knob position, loudness plus user
-EQ, and follows the knob while open. It only reads the config and the knob:
+EQ (two curves, right dashed, when the speakers get different EQ), and follows
+the knob while open. It only reads the config and the knob:
 nothing in the audio path changes, and nothing runs while it is closed. It
 needs `python-gobject`, `gtk4` and `libadwaita`. It shows the config as it is
 on disk, so after editing it restart the service to make both agree.

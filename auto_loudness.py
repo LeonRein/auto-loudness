@@ -26,9 +26,14 @@ DEFAULTS = {
     "ref_knob_db": 0.0,    # knob position (dB) at which music sounds "right" -> flat response
     "low_hz": 40.0,        # no extra bass below this (speaker limit; saves woofer excursion)
     "strength": 1.0,       # 1 = full ISO 226 compensation, smaller = gentler, 0 = off
+    "mono_bass_hz": 0.0,   # 0 = off; else both speakers play L+R below this crossover (LR4)
     "eq": [],              # fixed user EQ (e.g. room correction): [[eq]] tables, see config.example.toml
 }
 EQ_TYPES = ("peaking", "lowshelf", "highshelf", "lowpass", "highpass")
+EQ_CHANNELS = ("both", "left", "right")
+CHANNELS = (("L", "left"), ("R", "right"))  # graph prefix, [[eq]] channel name
+MONO_BASS_RANGE = (40.0, 250.0)
+LR4_Q = 1 / math.sqrt(2)  # Linkwitz-Riley 4th order = two Butterworth 2nd-order stages
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "auto-loudness/config.toml"
 SINK_NAME = "auto_loudness"
 
@@ -97,6 +102,11 @@ def interp(f, xs, ys):
 
 def biquad_db(f, kind, f0, q, gain=0.0):
     """Magnitude (dB) at f of PipeWire's bq_<kind> (RBJ cookbook, same formulas as its biquad.c)."""
+    return 20 * math.log10(max(abs(biquad_h(f, kind, f0, q, gain)), 1e-12))
+
+
+def biquad_h(f, kind, f0, q, gain=0.0):
+    """Complex response at f of PipeWire's bq_<kind>."""
     w0 = 2 * math.pi * f0 / RATE
     alpha, k, a = math.sin(w0) / (2 * q), math.cos(w0), 10 ** (gain / 40)
     k2 = 2 * math.sqrt(a) * alpha
@@ -110,12 +120,24 @@ def biquad_db(f, kind, f0, q, gain=0.0):
         "highpass": (((1 + k) / 2, -(1 + k), (1 + k) / 2), (1 + alpha, -2 * k, 1 - alpha)),
     }[kind]
     z = cmath.exp(-1j * 2 * math.pi * f / RATE)
-    h = (b[0] + b[1] * z + b[2] * z * z) / (d[0] + d[1] * z + d[2] * z * z)
-    return 20 * math.log10(max(abs(h), 1e-12))
+    return (b[0] + b[1] * z + b[2] * z * z) / (d[0] + d[1] * z + d[2] * z * z)
+
+
+def mono_bass_h(f, fc, own=1.0, other=0.0):
+    """Complex output of one channel's mono-bass split for inputs own/other:
+    own through the LR4 high pass, plus (own + other) / 2 through the LR4 low pass."""
+    lp = biquad_h(f, "lowpass", fc, LR4_Q) ** 2
+    hp = biquad_h(f, "highpass", fc, LR4_Q) ** 2
+    return hp * own + lp * (own + other) / 2
+
+
+def channel_eq(eq, channel):
+    """The [[eq]] bands that act on one speaker ('left' or 'right')."""
+    return [b for b in eq if b["channel"] in ("both", channel)]
 
 
 def response(f, gains, eq=()):
-    """Total response (dB): loudness bands plus the fixed user EQ."""
+    """Total response (dB): loudness bands plus the fixed user EQ (of one channel)."""
     return (sum(biquad_db(f, kind, f0, q, g) for (kind, f0, q), g in zip(BANDS, gains))
             + sum(biquad_db(f, b["type"], b["freq"], b["q"], b["gain"]) for b in eq))
 
@@ -155,8 +177,9 @@ def eq_params(knob_db, cfg):
         ata = [[sum(row[i] * row[j] for row in m) + (1e-3 if i == j else 0) for j in range(n)] for i in range(n)]
         atr = [sum(row[i] * x for row, x in zip(m, r)) for i in range(n)]
         gains = [g + d for g, d in zip(gains, solve(ata, atr))]
+    # one output gain for both channels (keeps the balance); the mono-bass split never boosts
     eq = cfg["eq"]
-    peak = max(response(f, gains, eq) for f in GRID + [b["freq"] for b in eq])
+    peak = max(response(f, gains, channel_eq(eq, ch)) for _, ch in CHANNELS for f in GRID + [b["freq"] for b in eq])
     if eq or any(abs(g) > 1e-6 for g in gains):
         peak += 0.01  # margin for peaks between grid points
     return gains, 10 ** (-max(0.0, peak) / 20)  # guarantees the whole response stays <= 0 dB
@@ -179,6 +202,10 @@ def load_config():
                 sys.exit(f"{CONFIG}: {k} must be {'a string' if want_str else 'a number'}")
         if any(c in user.get("target", "") for c in '"\\'):
             sys.exit(f"{CONFIG}: target must not contain quotes or backslashes")
+        mono = user.get("mono_bass_hz", 0)
+        if mono and not MONO_BASS_RANGE[0] <= mono <= MONO_BASS_RANGE[1]:
+            sys.exit(f"{CONFIG}: mono_bass_hz must be 0 (off) or from {MONO_BASS_RANGE[0]:.0f} to "
+                     f"{MONO_BASS_RANGE[1]:.0f}")
         cfg.update(user)
     return cfg
 
@@ -193,16 +220,20 @@ def check_eq(eq):
 
     if not isinstance(eq, list) or not all(isinstance(b, dict) for b in eq):
         sys.exit(f"{CONFIG}: eq must be a list of [[eq]] tables")
+    keys = {"type", "freq", "q", "gain", "channel"}
     out = []
     for i, b in enumerate(eq):
-        if b.keys() - {"type", "freq", "q", "gain"}:
-            sys.exit(f"{CONFIG}: eq #{i + 1}: unknown keys {sorted(b.keys() - {'type', 'freq', 'q', 'gain'})}")
+        if b.keys() - keys:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: unknown keys {sorted(b.keys() - keys)}")
         if b.get("type") not in EQ_TYPES:
             sys.exit(f"{CONFIG}: eq #{i + 1}: type must be one of {', '.join(EQ_TYPES)}")
         if b["type"] in ("lowpass", "highpass") and "gain" in b:
             sys.exit(f"{CONFIG}: eq #{i + 1}: {b['type']} has no gain")
+        if b.get("channel", "both") not in EQ_CHANNELS:
+            sys.exit(f"{CONFIG}: eq #{i + 1}: channel must be one of {', '.join(EQ_CHANNELS)}")
         out.append({"type": b["type"], "freq": num(b, i, "freq", 10, 20000, None),
-                    "q": num(b, i, "q", 0.1, 10, 0.707), "gain": num(b, i, "gain", -24, 24, 0.0)})
+                    "q": num(b, i, "q", 0.1, 10, 0.707), "gain": num(b, i, "gain", -24, 24, 0.0),
+                    "channel": b.get("channel", "both")})
     return out
 
 
@@ -275,23 +306,52 @@ def find_target(card_name, nodes):
     return None
 
 
-def filter_chain_conf(target, eq, gains, mult):
-    """Graph: input -> user EQ (fixed) -> two identical loudness chains a/b -> mixer.
+def filter_chain_conf(target, eq, gains, mult, mono_bass_hz=0.0):
+    """Graph per channel (L, R): input -> [mono-bass split] -> user EQ of that speaker ->
+    two identical loudness chains a/b -> mixer.
+
+    Mono bass: each channel = own signal through an LR4 high pass + (L + R) / 2 through an
+    LR4 low pass, so below the crossover both speakers play the same bass; for mono content
+    the split sums flat (LR4 low + high pass = all pass).
 
     PipeWire's biquads reset their state on every parameter change (audible click), so new
     values go to the silent chain, which is then crossfaded in (see Fader)."""
-    nodes = [(f"u{i}", b["type"], b["freq"], b["q"], b["gain"]) for i, b in enumerate(eq)]
-    for c in "ab":
-        nodes += [(f"{c}{i}", kind, f, q, g) for i, ((kind, f, q), g) in enumerate(zip(BANDS, gains))]
-    eqs = "\n".join(f'          {{ type = builtin name = {n} label = bq_{t} '
-                    f'control = {{ "Freq" = {f} "Q" = {q} "Gain" = {g:.3f} }} }}' for n, t, f, q, g in nodes)
-    pre = ["in"] + [f"u{i}" for i in range(len(eq))]
-    last = len(BANDS) - 1
-    pairs = list(zip(pre, pre[1:])) + [(pre[-1], "a0"), (pre[-1], "b0")]
-    pairs += [(f"{c}{i}", f"{c}{i + 1}") for c in "ab" for i in range(last)]
-    links = "\n".join(f'          {{ output = "{a}:Out" input = "{b}:In" }}' for a, b in pairs)
-    links += (f'\n          {{ output = "a{last}:Out" input = "mix:In 1" }}'
-              f'\n          {{ output = "b{last}:Out" input = "mix:In 2" }}')
+    def bq(name, kind, f, q, g=0.0):
+        return (f'          {{ type = builtin name = {name} label = bq_{kind} '
+                f'control = {{ "Freq" = {f} "Q" = {q} "Gain" = {g:.3f} }} }}')
+
+    def mixer(name, *gains_):
+        ctl = " ".join(f'"Gain {i + 1}" = {g:.6f}' for i, g in enumerate(gains_))
+        return f'          {{ type = builtin name = {name} label = mixer control = {{ {ctl} }} }}'
+
+    def link(a, b, port="In"):
+        return f'          {{ output = "{a}:Out" input = "{b}:{port}" }}'
+
+    nodes, links, last = [], [], len(BANDS) - 1
+    if mono_bass_hz:
+        nodes.append(mixer("mono", 0.5, 0.5))
+    for ch, name in CHANNELS:
+        nodes.append(f"          {{ type = builtin name = in{ch} label = copy }}")
+        head = f"in{ch}"
+        if mono_bass_hz:
+            for kind, p in (("lowpass", "lp"), ("highpass", "hp")):
+                nodes += [bq(f"{p}{ch}{s}", kind, mono_bass_hz, LR4_Q) for s in (1, 2)]
+                links += [link(head, f"{p}{ch}1"), link(f"{p}{ch}1", f"{p}{ch}2")]
+            nodes.append(mixer(f"x{ch}", 1.0, 1.0))
+            links += [link(f"lp{ch}2", "mono", f"In {1 if ch == 'L' else 2}"),
+                      link(f"hp{ch}2", f"x{ch}", "In 1"), link("mono", f"x{ch}", "In 2")]
+            head = f"x{ch}"
+        for i, b in enumerate(channel_eq(eq, name)):
+            nodes.append(bq(f"u{ch}{i}", b["type"], b["freq"], b["q"], b["gain"]))
+            links.append(link(head, f"u{ch}{i}"))
+            head = f"u{ch}{i}"
+        for c in "ab":
+            nodes += [bq(f"{c}{ch}{i}", kind, f, q, g) for i, ((kind, f, q), g) in enumerate(zip(BANDS, gains))]
+            links.append(link(head, f"{c}{ch}0"))
+            links += [link(f"{c}{ch}{i}", f"{c}{ch}{i + 1}") for i in range(last)]
+        nodes.append(mixer(f"mix{ch}", mult, 0.0))
+        links += [link(f"a{ch}{last}", f"mix{ch}", "In 1"), link(f"b{ch}{last}", f"mix{ch}", "In 2")]
+    nodes, links = "\n".join(nodes), "\n".join(links)
     return f"""
 context.spa-libs = {{ audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }}
 context.modules = [
@@ -304,15 +364,13 @@ context.modules = [
       node.description = "Loudness"
       filter.graph = {{
         nodes = [
-          {{ type = builtin name = in label = copy }}
-{eqs}
-          {{ type = builtin name = mix label = mixer control = {{ "Gain 1" = {mult:.6f} "Gain 2" = 0.0 }} }}
+{nodes}
         ]
         links = [
 {links}
         ]
-        inputs = [ "in:In" ]
-        outputs = [ "mix:Out" ]
+        inputs = [ "inL:In" "inR:In" ]
+        outputs = [ "mixL:Out" "mixR:Out" ]
       }}
       audio.channels = 2
       audio.position = [ FL FR ]
@@ -330,8 +388,12 @@ context.modules = [
 
 def log(knob, gains, mult, eq):
     db = 20 * math.log10(mult)
-    print(f"knob {knob:+.1f} dB -> " + ", ".join(f"{name} {response(f, gains, eq) + db:+.1f} dB" for name, f in
-                                                 (("40 Hz", 40), ("1 kHz", 1000), ("10 kHz", 10000))), flush=True)
+    points = (("40 Hz", 40), ("1 kHz", 1000), ("10 kHz", 10000))
+    per_channel = any(b["channel"] != "both" for b in eq)
+    parts = [(f"{ch} " if per_channel else "") + ", ".join(
+        f"{name} {response(f, gains, channel_eq(eq, cname)) + db:+.1f} dB" for name, f in points)
+        for ch, cname in (CHANNELS if per_channel else CHANNELS[:1])]
+    print(f"knob {knob:+.1f} dB -> " + " | ".join(parts), flush=True)
 
 
 class Fader:
@@ -349,12 +411,13 @@ class Fader:
 
     def apply(self, gains, mult):
         idle = "b" if self.active == "a" else "a"
-        self.send(" ".join(f'"{idle}{i}:Gain" {g:.3f}' for i, g in enumerate(gains)))
+        self.send(" ".join(f'"{idle}{ch}{i}:Gain" {g:.3f}' for ch, _ in CHANNELS for i, g in enumerate(gains)))
         time.sleep(self.SETTLE)
         old_in, new_in = ("1", "2") if self.active == "a" else ("2", "1")
         for step in range(1, self.STEPS + 1):
             f = step / self.STEPS
-            self.send(f'"mix:Gain {old_in}" {(1 - f) * self.mult:.6f} "mix:Gain {new_in}" {f * mult:.6f}')
+            self.send(" ".join(f'"mix{ch}:Gain {old_in}" {(1 - f) * self.mult:.6f} '
+                               f'"mix{ch}:Gain {new_in}" {f * mult:.6f}' for ch, _ in CHANNELS))
             time.sleep(self.FADE / self.STEPS)
         self.active, self.mult = idle, mult
 
@@ -367,7 +430,7 @@ def run(cfg, card, target, knob):
     """Run the Loudness sink until the 4i4 or its output goes away; returns the reason."""
     gains, mult = eq_params(knob, cfg)
     conf = Path(os.environ["XDG_RUNTIME_DIR"]) / "auto-loudness.conf"
-    conf.write_text(filter_chain_conf(target, cfg["eq"], gains, mult))
+    conf.write_text(filter_chain_conf(target, cfg["eq"], gains, mult, cfg["mono_bass_hz"]))
     chain = monitor = fader = None
     try:
         chain = sp.Popen(["pipewire", "-c", str(conf)])
@@ -379,7 +442,8 @@ def run(cfg, card, target, knob):
             time.sleep(0.1)
         else:
             sys.exit("filter-chain sink did not appear")
-        print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands", flush=True)
+        mono = f", mono bass below {cfg['mono_bass_hz']:.0f} Hz" if cfg["mono_bass_hz"] else ""
+        print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands{mono}", flush=True)
         log(knob, gains, mult, cfg["eq"])
         fader = Fader(node["id"], mult)
         logged, changed = knob, 0.0

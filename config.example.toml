@@ -17,9 +17,16 @@ ref_knob_db = 0.0
 # PipeWire sink node.name to play into; empty = first output of the card.
 #target = ""
 
+# Mono bass: below this crossover (Hz, 40-250) both speakers play the sum of left and right
+# (Linkwitz-Riley 4th order, flat for mono content). Fills a room dip that only one speaker
+# has at the listening position. 0 = off.
+#mono_bass_hz = 0
+
 # Fixed EQ, e.g. room correction, applied together with the loudness compensation.
 # One [[eq]] table per band. type: peaking, lowshelf, highshelf, lowpass, highpass
 # freq in Hz (10-20000), q (0.1-10, default 0.707), gain in dB (-24..24; not for lowpass/highpass).
+# channel: "both" (default), "left" or "right": room modes differ per speaker. The EQ acts on
+# what each speaker plays, after the mono-bass sum.
 # Boosts are fine: the output gain is lowered automatically so the total never exceeds 0 dB,
 # so no manual preamp is needed. Restart the service after changes.
 #[[eq]]
@@ -27,6 +34,13 @@ ref_knob_db = 0.0
 #freq = 356
 #q = 0.49
 #gain = 2.4
+#
+#[[eq]]
+#type = "peaking"   # room mode that only the right speaker excites
+#freq = 45
+#q = 8
+#gain = -9
+#channel = "right"
 #
 #[[eq]]
 #type = "highpass"   # protect small speakers from sub-bass
