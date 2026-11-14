@@ -21,6 +21,24 @@ class Test(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(parse_amixer(AMIXER), -100.0)
 
+    def test_parse_failed_read(self):
+        # the driver failed to read the element: amixer prints only the header and exits 0
+        self.assertIsNone(parse_amixer("\n".join(AMIXER.splitlines()[:2])))
+
+    def test_read_knob_retries_glitch(self):
+        bad = mock.Mock(returncode=0, stdout="\n".join(AMIXER.splitlines()[:2]), stderr="")
+        good = mock.Mock(returncode=0, stdout=AMIXER, stderr="")
+        with mock.patch.object(auto_loudness.sp, "run", side_effect=[bad, good]), \
+             mock.patch.object(auto_loudness.time, "sleep"):
+            self.assertEqual(auto_loudness.read_knob(2, "Master HW Playback Volume"), -100.0)
+
+    def test_read_knob_gives_up(self):
+        gone = mock.Mock(returncode=1, stdout="", stderr="amixer: Invalid card number '2'\n")
+        with mock.patch.object(auto_loudness.sp, "run", return_value=gone) as run, \
+             mock.patch.object(auto_loudness.time, "sleep"), mock.patch("sys.stderr"):
+            self.assertIsNone(auto_loudness.read_knob(2, "Master HW Playback Volume"))
+        self.assertEqual(run.call_count, 3)
+
     def test_iso_1khz_is_identity(self):
         for phon in (20, 40, 60, 80):
             self.assertAlmostEqual(contour(phon)[ISO_F.index(1000)], phon)

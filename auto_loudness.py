@@ -300,24 +300,32 @@ def find_card(name):
 
 
 def parse_amixer(out):
-    """amixer cget output -> knob position in dB, using the control's own dB range."""
+    """amixer cget output -> knob position in dB, using the control's own dB range.
+
+    None if value or dB range are missing: amixer still exits 0 when the driver fails to
+    read the element (Scarlett Gen 4: "USB response result ... was 16 expected 18")."""
     rng = re.search(r"min=(-?\d+),max=(-?\d+)", out)
     db = re.search(r"dBminmax-min=(-?[\d.]+)dB,max=(-?[\d.]+)dB", out)
     val = re.search(r": values=(-?\d+)", out)
     if not (rng and db and val):
-        sys.exit(f"unexpected amixer output (no dB range?):\n{out}")
+        return None
     vmin, vmax = int(rng[1]), int(rng[2])
     return float(db[1]) + (int(val[1]) - vmin) / (vmax - vmin) * (float(db[2]) - float(db[1]))
 
 
-def read_knob(card, control):
-    """Knob position in dB, or None if the control can't be read (unplugged, MSD mode)."""
-    try:
-        out = sp.check_output(["amixer", "-c", str(card), "cget", f"name={control}"], text=True,
-                              stderr=sp.DEVNULL)
-    except sp.CalledProcessError:
-        return None
-    return parse_amixer(out)
+def read_knob(card, control, tries=3):
+    """Knob position in dB, or None if the control can't be read (unplugged, MSD mode,
+    or a driver glitch that outlasted the retries)."""
+    for attempt in range(tries):
+        if attempt:
+            time.sleep(0.05)
+        r = sp.run(["amixer", "-c", str(card), "cget", f"name={control}"], capture_output=True, text=True)
+        knob = parse_amixer(r.stdout) if r.returncode == 0 else None
+        if knob is not None:
+            return knob
+    err = " ".join((r.stderr or r.stdout).split())
+    print(f"cannot read knob after {tries} tries: {err}", file=sys.stderr, flush=True)
+    return None
 
 
 def knob_error(card, control):
@@ -500,7 +508,7 @@ def run(cfg, card, target, knob):
         print(f"card {card}, target {target}, {len(cfg['eq'])} user EQ bands{mono}", flush=True)
         log(knob, gains, mult, cfg["eq"])
         fader = Fader(node["id"], mult)
-        logged, changed = knob, 0.0
+        logged, changed, misses = knob, 0.0, 0
 
         while chain.poll() is None:
             # events give instant updates; the 1 s timeout is a polling fallback
@@ -517,7 +525,13 @@ def run(cfg, card, target, knob):
                 return f"output {target} gone"
             new = read_knob(card, cfg["control"])
             if new is None:
-                return "4i4 disconnected"
+                # an unplug ends the monitor stream above; a failed read alone is usually a
+                # driver glitch, so keep the current EQ and try again on the next round
+                misses += 1
+                if misses >= 5:
+                    return "knob unreadable for 5 s"
+                continue
+            misses = 0
             if new != knob:
                 knob = new
                 gains, mult = eq_params(knob, cfg)
